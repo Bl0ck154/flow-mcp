@@ -1,10 +1,11 @@
 import { existsSync, mkdirSync, readdirSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { isAbsolute, join, relative, resolve } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { z } from "zod";
-import { assemble, localVoices, speakLocally } from "./assemble.js";
+import { assemble, localVoices, speakLocally, voiceTrack } from "./assemble.js";
 import { GEMINI_VOICES, geminiKey, saveGeminiKey, speakWithGemini } from "./gemini.js";
 import { extractLastFrame } from "./chain.js";
+import { burnCaptions, captionedName, captionSetup, previewCaptions, transcribe } from "./captions.js";
 import { characterLook, createCharacter, downloadAsset, trashAsset, editCharacter, getFlowState, listAssets, listCharacters, rememberCharacter, runAgentBatch, runContinue, runEdit, runGeneration } from "./flow.js";
 import { JobQueue, type Job } from "./queue.js";
 import { BIN, COMPUTER, IS_MAC, IS_WIN, moveToBin } from "./platform.js";
@@ -21,7 +22,7 @@ const sceneSchema = z.object({
   model: z
     .string()
     .optional()
-    .describe("Model label as shown in Flow, e.g. 'Omni 1.1 Flash', 'Veo 3.1 - Fast', 'Veo 3.1 - Quality', 'Nano Banana 2'. Omit to keep Flow's current model."),
+    .describe("Model label as shown in Flow, e.g. 'Omni 1.1 Flash', 'Veo 3.1 - Fast', 'Veo 3.1 - Quality', 'Nano Banana Pro'. Images default to the newest Nano Banana (2.1 today); video omitted keeps Flow's current model."),
   aspect_ratio: z.enum(["16:9", "9:16", "1:1", "4:3", "3:4"]).optional().describe("Video supports 16:9 and 9:16 only."),
   duration: z.union([z.literal(4), z.literal(6), z.literal(8), z.literal(10)]).optional().describe("Video length in seconds. Omni models only; Veo 3.1 clips are fixed at 8s."),
   resolution: z.enum(["360p", "720p"]).optional().describe("Video resolution. Omni models only."),
@@ -50,6 +51,47 @@ const sceneSchema = z.object({
 });
 
 // Raw shapes double as MCP input schemas and, wrapped in z.object, as HTTP body validators.
+const captionFields = {
+  video: z.string().min(1).describe("Absolute path of the video to caption: any MP4 or MOV on this computer, such as a film made with flow_assemble."),
+  style: z
+    .enum(["bold", "highlight", "reveal", "clean", "boxed"])
+    .default("bold")
+    .describe(
+      "bold: big capitals, 1-3 words at a time, the spoken word lights up (the short-form look). highlight: the spoken word sits on a coloured block. reveal: words appear as they are said. clean: classic subtitles. boxed: white words on a dark band.",
+    ),
+  position: z
+    .union([z.enum(["bottom", "middle", "top"]), z.number().min(0).max(100)])
+    .default("bottom")
+    .describe("bottom, middle or top - or a number for an exact height: how far down the frame the middle of the caption sits, 0 = top edge, 100 = bottom edge."),
+  size: z
+    .union([z.enum(["small", "medium", "large"]), z.number().min(40).max(250)])
+    .default("medium")
+    .describe("small, medium, large, or a percentage of the style's normal size (100 = medium, 150 = half again as big)."),
+  lead: z
+    .number()
+    .min(-0.5)
+    .max(0.5)
+    .optional()
+    .describe("Seconds the highlight runs ahead of the voice. Default 0.12; raise it if words still light up late, lower it if early."),
+  color: z.string().regex(/^#[0-9a-fA-F]{6}$/).optional().describe("Highlight colour as #RRGGBB, for bold, highlight and reveal."),
+  letters: z
+    .enum(["as_said", "capitals", "lowercase"])
+    .optional()
+    .describe("as_said keeps normal capitals (sentence starts, names); capitals is the high-energy short-form look; lowercase is the calm, casual look, and names still keep their capital in it. Default: capitals for bold, as_said for the rest."),
+  names: z
+    .array(z.string().min(1))
+    .max(50)
+    .optional()
+    .describe("Lowercase only: names to keep capitalised even where they start a sentence (e.g. [\"Juno\"]). Names in the middle of a sentence are found by themselves."),
+  text: z.string().max(50_000).optional().describe("Corrected words, to fix anything misheard. Timings are kept for every word that still matches; a line break starts a new caption."),
+  language: z
+    .string()
+    .default("auto")
+    .describe(
+      "Spoken language as a code: en, es, fr, de, pt, tr, ja, zh, ar... Pass it whenever you know it. auto detects it (a 60 MB detector downloads once). English uses a 148 MB model; every other language a 574 MB one, each downloaded the first time.",
+    ),
+};
+
 export const shapes = {
   status: { detailed: z.boolean().default(true).describe("false skips the plan/credits readout, which briefly opens Flow's account panel.") },
   generate: {
@@ -80,14 +122,56 @@ export const shapes = {
       .default(1)
       .describe("Volume of the clips' own sound, 0-1. Lower it (around 0.2-0.3) so a narration sits clearly on top; 1 keeps it as recorded."),
     voiceover: z.string().optional().describe("Absolute path to a voiceover audio file, starts at 0:00."),
+    voice_lines: z
+      .array(
+        z.object({
+          file: z.string().min(1).describe("Take to cut the line from: audio or video (its sound is used)."),
+          from: z.number().min(0).optional().describe("Start of the line within the take, seconds (from flow_transcribe word times)."),
+          to: z.number().min(0).optional().describe("End of the line within the take, seconds."),
+          at: z.number().min(0).describe("Where the line starts in the film, seconds."),
+          max_seconds: z.number().min(0.2).optional().describe("Longest it may last; a longer line is sped up slightly (at most 1.25x)."),
+        }),
+      )
+      .max(60)
+      .optional()
+      .describe(
+        "A timed voiceover built from separate lines, each placed at its own moment in the film - for example lines cut from several Flow takes in your avatar's voice, each landing on the title it describes. Replaces `voiceover`.",
+      ),
     output_name: z.string().default("final"),
     hold_last_frame: z.boolean().default(true).describe("Freeze the final frame so a longer voiceover is not cut off."),
   },
+  transcribe: {
+    video: z.string().min(1).describe("Absolute path of a video or audio file on this computer."),
+    language: z.string().default("auto").describe("Spoken language code (en, es, tr, ja...) or auto. Pass it whenever you know it."),
+    words: z.boolean().default(true).describe("Include every word with its start and end time in seconds."),
+  },
+  caption_preview: captionFields,
+  captions: {
+    ...captionFields,
+    project: z.string().optional().describe("Films folder to save into. Default: the video's own folder when it is already in the films folder, otherwise 'Captions'."),
+  },
+  caption_setup: {},
   agent: {
     project: z.string().min(1).describe("Folder name for the downloaded images."),
     scenes: z.array(z.string().min(1)).min(1).max(50).describe("One image description per scene, in order."),
     aspect_ratio: z.enum(["16:9", "9:16", "1:1", "4:3", "3:4"]).default("16:9"),
     download_quality: z.enum(["original", "upscaled"]).optional(),
+    references: z
+      .array(
+        z.object({
+          image: z.string().min(1).describe("Absolute image path, or 'asset:<title>' for an image or character already in the Flow project."),
+          name: z.string().min(1).max(40).describe("Short name the scenes use for it, e.g. 'Ines' or 'the station'."),
+        }),
+      )
+      .max(10)
+      .optional()
+      .describe(
+        "Reference images for the whole batch (characters, places, objects), attached once in the agent's composer like the + button does, so every scene stays on-model. Pair with scene_references to say which scenes use which.",
+      ),
+    scene_references: z
+      .array(z.array(z.string()))
+      .optional()
+      .describe("One list per scene, in scene order: the reference names that scene uses (empty list for none). Without it the agent decides which references fit each scene."),
   },
   voices: {},
   narrate: {
@@ -181,7 +265,7 @@ export const shapes = {
 
 type Args<K extends keyof typeof shapes> = z.infer<z.ZodObject<(typeof shapes)[K]>>;
 
-export const jobView = ({ id, status, params, files, attempts, credits, progress, note, error }: Job) => ({
+export const jobView = ({ id, status, params, files, attempts, credits, progress, note, error, failed_scenes }: Job) => ({
   id,
   status,
   project: params.output_dir,
@@ -193,6 +277,7 @@ export const jobView = ({ id, status, params, files, attempts, credits, progress
   files,
   note,
   error,
+  failed_scenes,
 });
 
 // One implementation runs in whichever process owns the Flow tab; the other process talks to it over HTTP (remote.ts).
@@ -218,6 +303,10 @@ export interface Core {
   continue_shot(a: Args<"continue_shot">): Promise<unknown>;
   agent(a: Args<"agent">): Promise<unknown>;
   outputs(): Promise<unknown>;
+  transcribe(a: Args<"transcribe">): Promise<unknown>;
+  caption_preview(a: Args<"caption_preview">): Promise<unknown>;
+  captions(a: Args<"captions">): Promise<unknown>;
+  caption_setup(): Promise<unknown>;
 }
 
 // Flow's own voices: still offered when giving a character a voice, but narration no longer goes through Flow.
@@ -332,9 +421,34 @@ export class LocalCore implements Core {
   }
 
   async retry({ job_ids }: Args<"retry">) {
-    const ids = job_ids ?? this.queue.list().filter((j) => j.status === "failed").map((j) => j.id);
-    const jobs = ids.map((id) => this.queue.retry(id)).filter((j): j is Job => Boolean(j));
-    if (!jobs.length) throw new Error("No failed jobs to retry.");
+    const ids = job_ids ?? this.queue.list().filter((j) => j.status === "failed" || j.failed_scenes?.length).map((j) => j.id);
+    const jobs: Job[] = [];
+    for (const id of ids) {
+      const job = this.queue.get(id);
+      const p = job?.params;
+      if (job?.failed_scenes?.length && p?.agent_scenes && job.status === "done") {
+        // A batch that finished with some images still failed: make just those again, under their own scene numbers,
+        // instead of re-running the whole batch. The list moves to the new job, so it is never retried twice.
+        const base = Number(p.file_stem.match(/\d+/)?.[0] ?? 1);
+        const numbers = p.agent_numbers ?? p.agent_scenes.map((_, i) => base + i);
+        const pick = job.failed_scenes.map((n) => numbers.indexOf(n)).filter((i) => i >= 0);
+        job.failed_scenes = undefined;
+        jobs.push(
+          this.queue.add({
+            ...p,
+            prompt: `Agent batch: ${pick.length} failed image(s) again`,
+            agent_scenes: pick.map((i) => p.agent_scenes![i]),
+            agent_numbers: pick.map((i) => numbers[i]),
+            agent_scene_refs: p.agent_scene_refs ? pick.map((i) => p.agent_scene_refs![i]) : undefined,
+            file_stem: `scene-${String(numbers[pick[0]]).padStart(2, "0")}`,
+          }),
+        );
+        continue;
+      }
+      const again = this.queue.retry(id);
+      if (again) jobs.push(again);
+    }
+    if (!jobs.length) throw new Error("Nothing to retry: no failed jobs, and no batch with failed images.");
     return { jobs: jobs.map(jobView) };
   }
 
@@ -361,8 +475,42 @@ export class LocalCore implements Core {
     return { dir, files };
   }
 
-  async assemble({ project, ...rest }: Args<"assemble">) {
-    return assemble({ dir: projectDir(project), ...rest });
+  async assemble({ project, voice_lines, ...rest }: Args<"assemble">) {
+    const dir = projectDir(project);
+    if (!voice_lines?.length) return assemble({ dir, ...rest });
+    mkdirSync(dir, { recursive: true });
+    const track = await voiceTrack(voice_lines, join(dir, `${rest.output_name.replace(/[^\w.-]+/g, "_")}-voice.wav`));
+    const film = await assemble({ dir, ...rest, voiceover: track.file });
+    return { ...film, voice: track };
+  }
+
+  // Captions never touch Flow or its queue: whisper.cpp hears the words, a headless Chrome of its own draws them.
+  async transcribe({ video, language, words }: Args<"transcribe">) {
+    const t = await transcribe(video, language);
+    return {
+      text: t.text,
+      word_count: t.words.length,
+      language: t.language,
+      model: t.model,
+      ...(words ? { words: t.words.map((w) => ({ text: w.text, start: Number(w.start.toFixed(2)), end: Number(w.end.toFixed(2)) })) } : {}),
+    };
+  }
+
+  async caption_preview(a: Args<"caption_preview">) {
+    return previewCaptions(a.video, a);
+  }
+
+  async captions({ project, ...a }: Args<"captions">) {
+    // Save next to the video when it is already one of the user's films, otherwise in a Captions folder.
+    const rel = relative(OUTPUT_ROOT, dirname(a.video));
+    const inFilms = rel !== "" && !rel.startsWith("..") && !isAbsolute(rel);
+    const dir = project ? projectDir(project) : inFilms ? dirname(a.video) : projectDir("Captions");
+    mkdirSync(dir, { recursive: true });
+    return burnCaptions(a.video, a, captionedName(dir, a.video));
+  }
+
+  async caption_setup() {
+    return captionSetup();
   }
 
   // Everything already downloaded, newest project first, so the panel can show past work after a restart.
@@ -390,9 +538,20 @@ export class LocalCore implements Core {
     return `${prefix}-${String(Math.max(0, ...onDisk, ...queued) + 1).padStart(2, "0")}`;
   }
 
-  async agent({ project, scenes, aspect_ratio, download_quality }: Args<"agent">) {
+  async agent({ project, scenes, aspect_ratio, download_quality, references, scene_references }: Args<"agent">) {
     const output_dir = projectDir(project);
+    if (scene_references && scene_references.length !== scenes.length) {
+      throw new Error(`scene_references has ${scene_references.length} entries for ${scenes.length} scenes; give one list per scene (empty for none).`);
+    }
+    const known = new Set((references ?? []).map((r) => r.name.toLowerCase()));
+    const unknown = [...new Set((scene_references ?? []).flat().filter((n) => !known.has(n.toLowerCase())))];
+    if (unknown.length) throw new Error(`scene_references names ${unknown.map((n) => `"${n}"`).join(", ")}, which is not in references.`);
+    for (const r of references ?? []) {
+      if (!r.image.startsWith("asset:") && !existsSync(r.image)) throw new Error(`Reference image not found: ${r.image}`);
+    }
     const job = this.queue.add({
+      agent_refs: references?.length ? references : undefined,
+      agent_scene_refs: references?.length ? scene_references : undefined,
       prompt: `Agent batch: ${scenes.length} images`,
       type: "image",
       max_credits: 0,

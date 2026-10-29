@@ -264,6 +264,25 @@ The preview tool could not read the project while it lived in ~/Desktop; check t
   newer clip could not be found by name and flow_assets looked unchanged. runGeneration now renames each finished
   tile to `<project>-<file_stem>` through the tile menu's `Rename` (renameTile, best effort - a failed rename must
   never lose the clip). The user asked for this; it removes a whole class of confusion.
+- FALSE "FAILED" CLIPS (2026-10-09, 31 in one session, every clip that used first/last frames): the job grabbed its
+  OWN UPLOAD instead of the clip. Frames and reference files are uploaded as `fm-<job>-<label>`; the upload tile
+  appears at once ("image 0%") and only gets its media id when processing ends, which was after the "before"
+  snapshot, so it looked new. Its menu offers only Delete, hence "tile menu has no Download item. It offered: Delete",
+  while the real clip sat finished in the grid (flow_download by title always worked). Now: freshMedia() skips
+  `fm-` tiles, tiles still showing "NN%", and tiles of the wrong kind (a video job only accepts flow-video-tile, an
+  image job flow-image-tile; edit and continue jobs accept videos only, so "Save frame" stills are ignored too), and
+  uploadAsset waits for its own tile by name until it carries data-media-id. Replayed against the live grid: the old
+  logic picked fm-db88e712-end.png, the new one waits and then picks the clip. Then verified on a paid clip (4 credits,
+  the user's OK): Omni 1.1 Flash 4 s 360p from an uploaded first frame -> job "done" in 63 s, the clip downloaded,
+  opening on the frame, progress readout working ("14%").
+- SECOND REFERENCE (2026-10-09, twice: a character, then an uploaded still): the click on "Add ingredients" produced
+  no picker at all and the job died after 10 s. Not reproducible on demand (character + upload, even mid-processing,
+  all opened fine), so attachAsset now retries the opener three times with Escape in between, and always switches
+  the picker to its All tab (it reopens on the last tab used, e.g. Characters). Verified with a real free still:
+  "asset:Juno" + an uploaded file -> both attached, the generated still (not the upload) downloaded.
+  Also noted: getByRole("button", { name: "Ingredient" }) also counts a hidden button outside the composer.
+- listAssets/downloadAsset now go to the project grid first: with a scene (or clip/character) view open, the scan
+  found nothing and flow_assets reported "no scenes" while one was on screen.
 - Gemini TTS: a LONG `style` note makes the model ramble - a 45-word line with a 25-word delivery note produced 674
   SECONDS of audio. The same line with no style note is 20.5 s, with a short note 32 s. Keep style notes to a few
   words, and sanity-check the returned duration against the expected one before using it.
@@ -303,6 +322,10 @@ The preview tool could not read the project while it lived in ~/Desktop; check t
   key passes a format check AND Google accepts it (models list, key in a header, no TTS quota), so a bad paste can
   never replace a working key. set_key is deliberately NOT an MCP tool - a key typed into the panel never reaches
   Claude. Tested only on the rejection path, so the user's real key was never overwritten.
+- Key format (2026-10-13): new Google AI Studio keys start "AQ" instead of "AIza", and saveGeminiKey's prefix check
+  (^AIza...) refused them in the panel. It now checks only the shape (20-512 key characters, no spaces, no template
+  text) and leaves validity to Google's own models-list check. Both requests send the key in the x-goog-api-key header,
+  which is format-agnostic. Privacy scans before a push must look for AQ-style keys as well as AIza ones.
 - CROSS-PLATFORM (2026-10-02): every OS difference lives in src/platform.ts - COMPUTER/BIN wording, moveToBin (Mac:
   rename into ~/.Trash; Windows: PowerShell Microsoft.VisualBasic ...SendToRecycleBin; Linux: `gio trash`, else
   ~/.local/share/Trash/files), extractZip (`tar` is bsdtar on macOS and Windows 10+ and reads ZIPs; `unzip` fallback),
@@ -342,3 +365,168 @@ The preview tool could not read the project while it lived in ~/Desktop; check t
   FLOW_MCP_PORT=8799 and FLOW_MCP_HOME=<scratch dir>. Never reuse the real home for that: a process that owns a port
   writes a fresh token to HOME/token, which locks every client of the real owner out (401). Symlink characters.json into
   the scratch home when looks must persist. Give the client a 60 s request timeout so the app's limit is reproduced.
+- FLOW IN ENGLISH (2026-10-13): every driver step finds a button by its ENGLISH accessible name (~45 labels), so a
+  Google account set to another language made the whole MCP fail. Measured on a spare tab: `?hl=es` turned every label
+  Spanish ("Inicio", "Menú para añadir contenido multimedia") on an English account, the choice holds through in-app
+  navigation (grid -> /edit/ -> back), a plain reload drops it, and a Spanish Accept-Language changes nothing (the
+  account's language wins over the browser's). So `?hl=en` overrides the account: launchChrome and getFlowPage load
+  `inEnglish(url)`, ensureProjectGrid compares paths (an address ending ?hl=en is already the grid) and reloads with
+  hl=en, and getFlowPage calls ensureEnglish, which reloads a non-English Flow page (`<html lang>`) and throws a clear
+  message if it stays foreign. Verified: the Flow tab put into Spanish, then a free still through a test MCP ->
+  switched to English, generated and downloaded (0 credits, 39 s).
+
+- COMPACT STUDIO (2026-10-13, the user found it "too big and bulky"): one density pass over the CSS, same look (stripe,
+  display font, orange tally, button styles). Floors kept on purpose: body and input text >= 16 px (iOS zooms into
+  smaller inputs; the global mobile-first rule), buttons and segments >= 38-46 px tall. Title on one line, 12 px
+  stripe, inputs 17 px with 10 px padding, labels 13 px, cards 14 px padding, headings 30 px, Roll bar 56 px. Pages
+  are 23-35% shorter on a phone. It also fixed a sideways scroll: at 390 px wide the old page was 427 px (checked with
+  a headless shot); every tab now fits at 375 px. Re-check with full-page headless shots per tab at 390 and 1440 wide
+  and an overflow scan (elements whose right edge passes the viewport, tabs row excluded).
+- GALLERY VIEWER (2026-10-13): Close and Move to Trash sat UNDER the media, and a tall clip (74vh) plus a wrapped path
+  pushed them off screen. They are now a bar on top, and every clip and still plays in one fixed black frame
+  (min(96dvh - 150px, 720px) tall, 960 px wide max, object-fit contain), so the viewer is the same size whatever is
+  open. Dialogs were also stuck in the top-left corner: the `*{margin:0}` reset kills <dialog>'s centring, so dialog
+  has margin:auto again. Close carries autofocus; showModal otherwise focused the red Trash button.
+- AGENT BATCHES + THE LEFT-HAND MENU (2026-10-13). An 11-image flow_agent_images run in another session failed at
+  once with "Could not switch Agent mode on" and made nothing. Flow was NOT redesigned (I first claimed it was; the
+  user corrected me): the left "Project navigation" (All media, Images, Videos, Characters, Scenes, Uploads, Tools,
+  Trash, Collapse) is where it always was. What was found, live:
+  1. ESCAPE SHUTS THE LEFT MENU. It is a Material drawer (mat-sidenav), and Escape closes it whenever the keyboard focus
+     is inside it. Clicking "All media" left the focus there, so the next dismissOverlays Escape shut the menu for the
+     rest of the session (the user's menu vanished; traced with DEBUG=pw:api plus a second connection watching the
+     menu). "All media" was then hidden and every later click on it waited out Playwright's 30 s default: a 3-image
+     agent batch took 6.4 min. leaveSideMenu() blurs the focus after each menu click and before every dismissOverlays
+     Escape. A page load restores the drawer to the saved state (localStorage flow-sidenav-collapsed, shared by every
+     project in that Chrome).
+  2. Collapse turns the menu into a strip of icons with no labels; getByText found nothing visible. clickProjectNav()
+     matches the button by its text, which holds icon name and label in both states; openProjectNav() reloads once if
+     the menu still is not showing. showAllMedia() falls back to the top bar's Filter menu (`Filtering and sorting
+     options`: tick boxes, `Clear all filters`, Sort by Newest/Oldest) only when the menu cannot be used.
+  3. The top bar also has a gear `Settings` ("View settings": Grid/Batch layout, tile size, toggles), so an unscoped
+     getByRole("button", { name: "Settings" }) matched it AND the agent's Settings: strict-mode error. Scoped to
+     `flow-base-prompt-box`.
+  4. Some menus ignore Escape (the agent panel's model menu did) and leave `cdk-overlay-backdrop settings-menu-backdrop`
+     over the page, swallowing every click, the Agent chip's included. dismissOverlays clicks showing backdrops away
+     (closes the menu, picks nothing); setAgentMode clears them and closes the agent settings panel (`flow-agent-panel`
+     -> `Back`; Escape does not close it, and while open it hides the Agent chip) before each try, and its error quotes
+     what intercepted the click. If agent mode still cannot be used, every scene goes the one-by-one route.
+  Progress names each step; FLOW_MCP_DEBUG=1 prints timed steps on stderr. Image models are now Nano Banana Pro,
+  Nano Banana 2 Lite and Nano Banana 2.1 (all 0 credits at x1); plain "Nano Banana 2" is gone. The user's call: images
+  ALWAYS default to the newest; newestNanoBanana() picks the highest version number that is not Lite from Flow's own
+  menu, for image jobs with no model, "Nano Banana" or "Nano Banana 2", and for the agent's image default.
+  Verified live, 0 credits: three 3-image batches (all from the agent, right order; 90 s each once All media stopped
+  waiting, against 6.4 min), a batch with a scene forced missing (asked again, then one by one, composer moved from
+  2 Lite to 2.1), and with the menu open and collapsed: flow_characters 6.6 s, flow_assets 5.6 s (was 15.5), the menu
+  still open afterwards. Afterwards Flow had agent mode off, confirm back on Always, no backdrop, panel closed.
+- RENAMED VIDEO NOT FOUND (2026-10-15, reported by a user of the public repo): "locator.waitFor: Timeout 30000ms
+  exceeded ... flow-grid-tile-container[aria-label="<the prompt>"]". A video tile at rest has no media id, so TILE_ID_JS
+  hands back "title:<Flow's title>"; runGeneration then renamed the tile to <project>-<stem> and asked downloadMedia
+  for the OLD title, which no longer existed. The clip was finished and renamed in Flow (credits spent, file not
+  downloaded). Now the handle follows the rename, and a tile that cannot be found again says so in words and points at
+  flow_download. Not re-run on a paid clip yet; images are unaffected (they carry data-media-id).
+  SAME USER, AFTER UPDATING (2026-10-16): "could not be found again in the grid (looked for "<the prompt>")". Watched
+  live on a paid 4 s Omni clip (4 credits, user's OK), logging the top tile every second: 9 s titled with the PROMPT,
+  no thumbnail, NO "NN%" yet; 12 s Flow's own short title ("Paper boat drifting across pond") and "0%"; 34 s "100%";
+  35 s img[alt="Generated video thumbnail"]; 36 s the % gone. The old rule (no "NN%" = finished) took the tile in
+  those first seconds, so the rename failed and the prompt-title then vanished. (The user guessed "after 100%"; it is
+  the start.) freshMedia now counts a video tile without its thumbnail (or a <video>) as busy, and waitForNewMedia
+  takes title-tracked tiles only once the same titles show on two polls running. Same clip with the fix: done in
+  48 s, renamed SettleTest-scene-01, 4.0 s file downloaded.
+- RETRY ONLY THE FAILED IMAGES (2026-10-18, the user's request). A batch that ends "done" with some scenes still
+  failed (after the agent was asked again and the one-by-one route) now records job.failed_scenes (scene numbers).
+  flow_retry on such a job queues a NEW agent batch of just those scenes with agent_numbers, so they save as scene-07,
+  scene-12 (numberOf() in agentRound and the one-by-one fallback); the list moves to the new job so it is never retried
+  twice. The Monitor shows "Retry N failed image(s)" on that batch (before, Retry only showed on failed jobs, and would
+  have re-run the whole batch). The note now starts with "still failed: ..." (the panel clamps notes to two lines).
+  Test hooks: FLOW_MCP_SIMULATE_MISSING=n drops scene n from agent rounds, FLOW_MCP_SIMULATE_FAILED=n skips its
+  one-by-one rerun; neither applies to a retry batch. Verified live, 0 credits: 3 scenes with 2 forced to fail ->
+  done with scene-01/03 and "still failed: scene 2", the panel button pressed in a headless panel -> only scene-02
+  made -> folder 01, 02, 03; the button gone afterwards.
+- TRASH GUARD WAS BLIND TO DUPLICATES: scanGrid keeps one entry per title, so trashAsset's "two items share this name"
+  check never fired and it trashed one of several same-titled tiles. countTitled() counts copies by media id (images)
+  and by how many show at once (id-less videos). Verified: three "Red fox sitting in snow" -> refused.
+- BULK DOWNLOAD PACE (2026-10-19, the user's call: "trim down to random 4-4.4"). A 20-image agent batch took 231 s,
+  113 s of it downloads at ~5.6 s each, all in the steps around Flow's tile menu (More options -> Download -> 1K
+  Original size): a grid re-scan before every tile, hoverTile's fixed 900 ms, waitForDownloadedFile polling once a
+  second (two equal sizes = 2 s minimum), and a fixed 800 ms after. Now: no re-scan when the tile is already mounted,
+  a 250 ms hover then a wait for the More options button itself (locator.isVisible({ timeout }) does NOT wait - it
+  answers at once), 250 ms polling, and each download held to a random 4-4.4 s (downloadPace). Measured on 6 images:
+  4.2, 4.1, 4.2, 4.0, 4.4, 4.4 s, all 1024x1024 originals in scene order. Other hoverTile callers keep 900 ms.
+- CAPTIONS (built 2026-10-08, `src/captions.ts`, Studio tab "Captions", MCP `flow_captions`): Homebrew's ffmpeg 8.1
+  has NO text filters at all (no ass, subtitles, drawtext - no libass/freetype), so captions are drawn by headless
+  Chrome (playwright-core `chromium.launch` on the system Chrome with a throwaway profile, never the Flow profile) as
+  transparent full-frame PNGs, one per distinct caption state, played as an ffconcat image track with exact durations
+  and `overlay`-ed onto the video (libx264 veryfast crf 18, AAC copied). Words come from whisper.cpp (`whisper-cli`,
+  brew `whisper-cpp`) with `-ojf`: build words from TOKENS (leading space = new word), because `-ml 1 -sow` segments
+  run each word into the next and hide every pause. Measured against the waveform: plain token offsets land within
+  ~50 ms of the real word onset; `-dtw` (needs `-nfa`, else t_dtw is -1) was ~150 ms LATE; large-v3-turbo placed a
+  word 0.6 s early and drops punctuation - so small.en > base.en > ... > turbo. 20 s of speech: 1 s to transcribe,
+  ~0.3 s per preview, ~8 s to burn. Transcripts cache in ~/.flow-mcp/captions; the media route only serves
+  OUTPUT_ROOT, uploads and that folder (previews 404'd until it was allowed). Edited text is re-timed by LCS against
+  the heard words; a line break forces a new caption. Captions break at commas and sentence ends; `text-wrap:balance`
+  stops a lone word on line two.
+- TESTING THE PANEL without touching the real one or Flow: a script that sets FLOW_MCP_PORT=8799, FLOW_MCP_HOME and
+  FLOW_MCP_OUTPUT to scratch dirs BEFORE dynamically importing dist/core.js + dist/server.js, overrides
+  core.status/characters/assets (status -> getFlowState -> getBrowser LAUNCHES the Flow Chrome when CDP is down), then
+  startServer(core); open http://127.0.0.1:8799 in the Browser pane. Kill the node pid itself afterwards - pkill on
+  the background shell left it listening.
+- Caption placement: `position` is bottom|middle|top or a number 0-100 (how far down the frame the caption's middle
+  sits); the panel has an exact-height slider and tap-the-preview. Bold pop scales the spoken word by 1.06 - at 1.08
+  with no word margin it swallowed the space beside it ("EVERYTHINGAFTER"), so words carry a .07em margin.
+  First Ascent's finished film survived the Trash only because it was published in an artifact (film.mp4); it is back
+  at ~/flow-mcp-out/Ascent/ascent-1080.mp4.
+- Caption letters (2026-10-09): `letters` as_said | capitals | lowercase, per style in the panel (Bold pop defaults
+  to capitals, the rest to as_said). It is a CSS text-transform on the drawn captions only; the .srt keeps the words as
+  heard. capitals and lowercase drop trailing commas and full stops (? and ! stay), the short-form convention; capitals
+  in a non-bold font take 1.2x the line width, lowercase in Arial Black 0.85x. Panel labels are "Normal / CAPS /
+  lower" because "CAPITALS" and "lowercase" were cut off at 375 px wide.
+- Speech model (2026-10-09, the user's call): it downloads BY ITSELF the first time words are needed - picking a video
+  in the Captions tab, or the first flow_captions call - not from a button. ggml-base.en.bin, 148 MB, from
+  huggingface ggerganov/whisper.cpp (FLOW_MCP_MODEL_URL for a mirror), into ~/.flow-mcp/models, via a .part file.
+  It uses CURL, not fetch: Node's built-in fetch (undici) crashed the whole process with "assert(!this.paused)" when
+  the server closed the connection mid-download, and that process is the panel or Claude's connector. caption_setup
+  is "ready" once whisper-cli exists; the panel shows "Getting the speech model (148 MB, one time only)" while it
+  downloads. Tested with a local stand-in server (HOME pointed at an empty folder): first use, two callers at once
+  (one download), a second download in the same panel process, and an unreachable server (clear error, no leftovers).
+  The real huggingface download has not been run from this code.
+- Caption timing (2026-10-11, "words light up a bit late"): measured on the First Ascent narration against each word's
+  real onset in the sound (words after a pause): whisper's token start was 0.00 s for about half and 0.13-0.18 s LATE
+  for the rest (one outlier 0.53). AV sync tolerance is asymmetric (ITU-R BT.1359: a picture lagging its sound shows from
+  ~45 ms, one leading it goes unnoticed to ~125 ms), so every caption state now starts LEAD = 0.12 s early (`lead`
+  option, -0.5..0.5, MCP only). The .srt shifts with it (first cue 0.22 -> 0.10). Size is now a percentage too
+  (`size` small|medium|large or 40-250; the panel has a 50-180 % slider; old saved presets map to 80/100/120).
+- VOICEOVER IN THE USER'S OWN VOICE (2026-10-12): Flow's Voices tab holds only the 15 stock voices (the same as
+  Google AI Studio's); the user's own voice comes with the "Me" avatar, and the only way to make it speak is a paid
+  video take with reference_images ["asset:Me"] and the line in the prompt ("He says these exact words and nothing
+  else: ..."), keeping just the sound (Omni 1.1 Flash 360p: 4/5/6/7 credits for 4/6/8/10 s). Flow cannot time speech
+  to on-screen titles, so timing is local: flow_transcribe gives each word's start/end, and flow_assemble's
+  voice_lines places each line (file, from, to, at, max_seconds -> atempo up to 1.25x, per-line loudnorm) at its own
+  moment. The voice track is written as PCM WAV: AAC .m4a from delayed+mixed lines was unreadable ("Cannot calculate
+  dts entry length"), and whisper-cli exits 0 and writes no JSON on unreadable audio, so transcribe now checks for it.
+  Cut lines at the gap between words (midpoint), not word end + padding: padding pulled the next word's start in.
+- CAPTION LANGUAGES (2026-10-13): the auto-downloaded model was English-only (base.en) and "auto" picked it, so a
+  Spanish video got English-sounding nonsense with no error ("(speaking in foreign language)" at best). Now three
+  models, each fetched on first need (FLOW_MCP_MODEL_BASE = mirror folder): base.en 148 MB for English (best timing;
+  English fetches it even when a multilingual model exists, falling back to that one only if the download fails),
+  large-v3-turbo-q5_0 574 MB for every other language, and base-q5_1 60 MB that only DETECTS the language for "auto"
+  (whisper-cli -dl; the line "auto-detected language: xx" is on stderr and -np hides it). Measured on Mac `say` lines:
+  turbo heard every Spanish/German word where small-q5_1 (190 MB) misheard "ni un solo" -> "guión solo"; word starts
+  of both were within ~0.05 s of the waveform for most words; base-q5_1 detected 8/8 languages in 0.2 s. Detection
+  runs once per video ("auto" has its own cache entry). UNSPACED languages (ja, zh, yue, th...) get words from
+  Intl.Segmenter over a per-character timeline built from the tokens (tokens there are word pieces: 人/工/知/能), are
+  joined with no space, hold 3x the words per caption and count as full-width; edited text is segmented the same way
+  so alignText still matches. <html lang> is set so capitals follow the language (Turkish BİRLİKTE), RTL scripts get
+  dir=rtl (checked with Arabic text: order and highlight right). The panel has a "Spoken language" select (37 languages
+  + Detect automatically), defaulting to the browser's language when listed, else English; changing it re-listens and
+  drops corrections. The panel read transcribe's `words` (now an array since flow_transcribe) as the word count; it
+  now asks words:false and shows word_count.
+- NAMES IN LOWERCASE CAPTIONS (2026-10-18, the user's rule: "always capitalize names even if lower case selected").
+  namesIn(): a word written with a capital where no sentence starts (the speech model and corrections capitalise
+  names), every other occurrence of it, plus `names` passed in (for a name that only ever starts sentences, "Juno");
+  "I" is not a name. The page marks those words `.w.name{text-transform:none}`. Checked on Sol Tomorrow, boxed
+  lowercase: "Sol said the same word every morning", "he just went". TRAP: the page script lives inside a TS template
+  literal, so a regex there needs `\\p{L}` in the source - with `\p{L}` the page got `p{L}`, matched nothing, and
+  the name stayed lowercase without any error.
+- CAPTIONS WORKFLOW (the user's rule, 2026-10-18): transcribe first, show the words with likely mishearings fixed,
+  get the user's OK, THEN make the video once. The playbook and the flow_captions description say so too.
+

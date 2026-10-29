@@ -27,6 +27,7 @@ New here? [GETTING-STARTED.md](GETTING-STARTED.md) takes you from nothing to you
 | **A Google account** | Free. Flow gives every account 50 credits a day; a paid Google AI plan adds more and unlocks 1080p downloads. Developed on a Pro plan |
 | **FFmpeg** *(optional)* | Mac: `brew install ffmpeg` · Windows: `winget install Gyan.FFmpeg`. Needed only to join clips, mix music or record narration |
 | **A Google AI Studio key** *(optional, free)* | Only for the Google narration voices. See below |
+| **whisper.cpp** *(optional, free)* | Only for captions: it hears the words, on your computer. Mac: `brew install whisper-cpp` · Windows: `whisper-cli.exe` from [the whisper.cpp releases](https://github.com/ggml-org/whisper.cpp/releases), on your PATH. The speech model it needs downloads by itself the first time you caption a video: 148 MB for English, 574 MB for any other language |
 
 A display must stay awake: the Chrome window is really being driven, so the machine cannot be
 headless or asleep mid-run.
@@ -143,7 +144,7 @@ npm run studio     # then open http://127.0.0.1:8787
 
 or double-click **Flow Studio.command** (Mac) or **Flow Studio.cmd** (Windows).
 
-Seven tabs, in the order you would use them:
+Eight tabs, in the order you would use them:
 
 - **Cast**: reusable characters. Create them, edit them in place, or build one from a picture.
 - **Frames**: free stills, with *match previous frame* to keep a set on-model.
@@ -156,6 +157,13 @@ Seven tabs, in the order you would use them:
 - **Cut**: join any videos into one film, in the order you pick. Upload one, or choose from films you've
   already made. Add a narration (from your saved ones or an upload) and music, and turn the clips' own
   sound down so the narration sits on top.
+- **Captions**: put the spoken words on screen, the way short-form videos do, on wide or vertical videos.
+  Pick a video and the language spoken in it (about 100 languages, or Detect automatically), choose a
+  style (Bold pop, Highlight, Word by word, Clean, Boxed), where it sits (bottom,
+  middle, top, an exact height, or tap the preview), its size (a slider), its letters (normal, CAPS or lowercase) and
+  highlight colour, and see it on a real frame of your video before anything is made. Fix any misheard
+  word in the text box and it keeps its timing; press Enter to start a new caption. Saves `<name>-captions.mp4` plus an `.srt` for YouTube.
+  Everything happens on your computer; nothing is uploaded.
 - **Library**: everything in your Flow project. Download it again for free (a scene comes down as one
   finished film, not loose clips), or move it to Flow's Trash.
 
@@ -187,7 +195,7 @@ agree on what is running. That API listens on 127.0.0.1 only and needs a per-run
 | `flow_assets` | List images and videos already in the Flow project (usable as `asset:<title>`) |
 | `flow_download` | Download existing project media without regenerating. Free, including the 1080p / 2K upscale. A scene comes down as one stitched film |
 | `flow_trash` | Move an image, video or scene in the Flow project to Flow's Trash, where it can be restored. Exact title only; refuses if two items share it; never deletes permanently |
-| `flow_agent_images` | Fast image batch: hands up to 50 scenes to Flow's own Agent mode, rendered in parallel (20 images in ~204 s), 0 credits. Each image is matched back to its scene by its stored prompt, so file numbers are right in any finish order. Scenes the agent drops are re-asked of it (up to 2 rounds), then re-run one by one |
+| `flow_agent_images` | Fast image batch: hands up to 50 scenes to Flow's own Agent mode, rendered in parallel (20 images in ~204 s), 0 credits. Each image is matched back to its scene by its stored prompt, so file numbers are right in any finish order. Scenes the agent drops are re-asked of it (up to 2 rounds), then re-run one by one. `references` attaches characters, places and objects once in the agent's composer (like its + button), and `scene_references` says which scenes use which, so a whole story stays on-model; scenes made one by one keep their references |
 | `flow_edit` | Video-to-video edit of a clip already in the project (relight, weather, remove objects). Flow shows no quote first; about 20 credits for a 4 s clip |
 | `flow_continue` | Start a clip from the last frame of an existing one **with a character or your avatar still attached**. The composer allows a start frame or attached characters, never both, so this drives Flow's agent mode, which does both. No quote beforehand |
 | `flow_character` | Create a reusable character from a description (Flow draws the portrait) or an image, with a personality and a stock voice; use it as `asset:<name>` |
@@ -196,7 +204,9 @@ agree on what is running. That API listens on 127.0.0.1 only and needs a per-run
 | `flow_techniques` | 39 film-technique prompt presets (camera moves, product shots, transitions, image commands); pass an id as a scene's `technique` |
 | `flow_narrate` | Free narration audio, any length: `gemini` (Google AI Studio text-to-speech, with the same voices Flow has, plus a `style` note) or `mac` (a voice installed on this computer, no key needed) |
 | `flow_voices` | Narrator voices available, and whether a Google key is set up |
-| `flow_assemble` | Join clips into one MP4 (a project's clips, or any you list, in order) with optional music and voiceover, and separate volume for the clips' own sound (local FFmpeg, no credits) |
+| `flow_captions` | Burn spoken-word captions into any video, landscape or vertical, in one of five styles, at any height and size, in normal, capital or lowercase letters, in about 100 languages; returns the transcript so a misheard word can be fixed and the call repeated (local whisper.cpp, Chrome and FFmpeg, no credits) |
+| `flow_transcribe` | Hear the words in any video or audio on your computer, with each word's start and end time (local whisper.cpp, free) |
+| `flow_assemble` | Join clips into one MP4 (a project's clips, or any you list, in order) with optional music and voiceover, and separate volume for the clips' own sound. A voiceover can also be built line by line (`voice_lines`), each line cut from a take and placed at its own moment, for narration timed to on-screen titles (local FFmpeg, no credits) |
 
 **Continuity between shots:** `chain_previous` (this clip starts on the last frame of the previous
 one), `first_frame` + `last_frame` (animate between two stills you chose), `reference_images` (keep a
@@ -222,6 +232,9 @@ key → Save key**. It's checked with Google before it's saved, and stored only 
   invisible reCAPTCHA; this drives the real interface at human pace and does nothing to evade it.
 - Before each generation the server reads Flow's own credit quote and skips the scene if it exceeds
   `max_credits` (default 25).
+- Any Google account language works. The server finds Flow's buttons by their English names, so its
+  Chrome window always shows Flow in English (it adds `?hl=en` to the address). Your account's own
+  language setting is never changed, and prompts can be written in any language.
 - Environment variables: `GEMINI_API_KEY`, `FLOW_MCP_PORT` (8787), `FLOW_MCP_OUTPUT`,
   `FLOW_MCP_HOME`, `FLOW_MCP_CDP_PORT` (9333), `FLOW_MCP_CHROME`, `FLOW_MCP_PAUSE_MIN_S`,
   `FLOW_MCP_PAUSE_MAX_S`.
@@ -234,6 +247,13 @@ key → Save key**. It's checked with Google before it's saved, and stored only 
 | *"Not signed in"* or *"no project open"* | Run `npm run login`, sign in, open a Flow project, leave the window open |
 | A clip generated but no file arrived | The media is still in Flow. `flow_download` pulls it back for nothing. Never re-generate and pay twice |
 | Everything times out | The Chrome window was closed, or the machine slept. Reopen it with `npm run login` |
+
+---
+
+## Updating
+
+Tell your assistant: *"Update Flow MCP: in my flow-mcp folder, run git pull, then npm install, then npm run
+build."* Then fully quit and reopen your assistant app so it loads the new version.
 
 ---
 

@@ -2,10 +2,10 @@ import { closeSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, openSync, 
 import { homedir, tmpdir } from "node:os";
 import { basename, extname, join } from "node:path";
 import type { Locator, Page } from "playwright-core";
-import { HOME_DIR, getFlowPage } from "./chrome.js";
+import { HOME_DIR, getFlowPage, inEnglish } from "./chrome.js";
 import type { Job } from "./queue.js";
 import { extractZip } from "./platform.js";
-import { allMediaControl, completedMediaIds, completeAssetSelection, UI_NAMES, newPolicyRefusal, openTileDownloadMenu, pickRadio, setAgentMode, verifyResolution } from "./flow-ui.js";
+import { agentModeEnabled, agentModeToggle, allMediaControl, completeAssetSelection, UI_NAMES, newPolicyRefusal, openTileDownloadMenu, pickRadio, verifyResolution } from "./flow-ui.js";
 
 export interface FlowState {
   url: string;
@@ -43,9 +43,48 @@ export async function getFlowState(detailed = false): Promise<FlowState> {
 
 // Menus close on Escape; the account panel does not and needs its own close button.
 async function dismissOverlays(page: Page): Promise<void> {
+  await leaveSideMenu(page);
   await page.keyboard.press("Escape");
   const closePanel = page.getByRole("button", { name: UI_NAMES.closeAccountPanel });
   if (await closePanel.isVisible().catch(() => false)) await closePanel.click({ timeout: 5000 }).catch(() => {});
+  await clearBackdrops(page);
+}
+
+// Some of Flow's menus ignore Escape (the agent's model menu did, 2026-10-13), and the invisible backdrop behind an
+// open menu ("cdk-overlay-backdrop settings-menu-backdrop") then swallows every click on the page: that is how an agent
+// batch failed with "Could not switch Agent mode on". Clicking the backdrop is how such a menu closes, picking nothing.
+async function clearBackdrops(page: Page): Promise<void> {
+  const showing = page.locator(".cdk-overlay-backdrop.cdk-overlay-backdrop-showing");
+  for (let i = 0; i < 4 && (await showing.count().catch(() => 0)); i++) {
+    await showing.last().click({ force: true, timeout: 4000 }).catch(() => {});
+    await pause(page, 500);
+  }
+}
+
+// The agent's own image model, set to the newest Nano Banana like single images. Best effort: a batch never fails over it.
+async function pickAgentImageModel(page: Page): Promise<void> {
+  const button = page.locator("flow-agent-panel").getByRole("button", { name: "Image generation default model" });
+  if (!(await button.isVisible().catch(() => false))) return;
+  await button.click({ timeout: 5000 }).catch(() => {});
+  const items = page.getByRole("menuitem");
+  if (!(await items.first().isVisible().catch(() => false))) await items.first().waitFor({ state: "visible", timeout: 4000 }).catch(() => {});
+  const names = (await items.allInnerTexts().catch(() => [] as string[])).map((t) => t.replace(/\s+/g, " ").trim());
+  const index = newestNanoBanana(names);
+  const shown = (await button.innerText().catch(() => "")).replace(/\s+/g, " ");
+  if (index >= 0 && !shown.includes(names[index])) await items.nth(index).click({ timeout: 4000 }).catch(() => {});
+  else await page.keyboard.press("Escape");
+  await pause(page, 400);
+  await clearBackdrops(page);
+}
+
+// The agent settings panel replaces the composer, hiding the Agent button; Back closes it without saving.
+async function closeAgentSettings(page: Page): Promise<void> {
+  const back = page.locator("flow-agent-panel").getByRole("button", { name: "Back", exact: true });
+  if (await back.isVisible().catch(() => false)) {
+    await clearBackdrops(page);
+    await back.click({ timeout: 5000 }).catch(() => {});
+    await pause(page, 800);
+  }
 }
 
 // The balance only shows inside the account panel. That panel also holds "Sign out": never touch anything else in it.
@@ -189,15 +228,57 @@ export async function retryNewErrorTiles(
   return { errors, reachedKnown, retried };
 }
 
-async function waitForNewMedia(page: Page, before: string[], count: number, timeoutMs: number, job?: Job): Promise<string[]> {
+type MediaKind = "image" | "video";
+
+// New tiles that can be the result we are waiting for. Three things looked "new" here without being it (2026-10-09:
+// 31 finished clips reported failed with "tile menu has no Download item. It offered: Delete"):
+// - our OWN uploads (first/last frames, references - always named fm-<job>-...): an upload's tile shows up while it is
+//   still processing and only gets its final id a moment later, after the "before" snapshot, so it read as new;
+// - a tile of the wrong kind, such as the still that "Save frame" makes on the way to a continuation clip;
+// - a tile still rendering ("NN%").
+export async function freshMedia(page: Page, before: string[], kind?: MediaKind): Promise<string[]> {
+  const tiles = await page.evaluate(
+    (js) => {
+      const idOf = eval(js) as (t: Element) => string | undefined;
+      return [...document.querySelectorAll("flow-grid-tile-container")].map((t) => ({
+        id: idOf(t),
+        kind: t.querySelector("flow-video-tile") ? "video" : t.querySelector("flow-image-tile") ? "image" : "other",
+        label: t.getAttribute("aria-label") ?? "",
+        // For the first seconds after Start generation, before any "NN%" shows, a new video tile is titled with the
+        // prompt itself and has no thumbnail; then it takes a short title of Flow's own and counts up; finished, it
+        // has its thumbnail (watched live 2026-10-16, a 4 s clip: prompt title at 9 s, "0%" at 12 s, 100% at 34 s,
+        // thumbnail at 35 s). The old test - no "NN%" means done - took the tile in those first seconds and lost a
+        // user's clip. A video without its thumbnail counts as busy.
+        busy:
+          /\d+%/.test((t as HTMLElement).innerText) ||
+          (!!t.querySelector("flow-video-tile") && !t.querySelector('img[alt="Generated video thumbnail"], video')),
+      }));
+    },
+    TILE_ID_JS,
+  );
+  const ours = tiles.filter((t) => t.id && !before.includes(t.id) && !t.label.startsWith("fm-") && !t.busy && (!kind || t.kind === kind));
+  return [...new Set(ours.map((t) => t.id!))];
+}
+
+async function waitForNewMedia(page: Page, before: string[], count: number, timeoutMs: number, job?: Job, kind?: MediaKind): Promise<string[]> {
   const deadline = Date.now() + timeoutMs;
   let retriesLeft = job?.params.retries ?? 1;
   let failures = 0;
+  let seen = "";
   while (Date.now() < deadline) {
     await pause(page, 2000);
-    const fresh = [...new Set((await completedMediaIds(page, TILE_ID_JS)).filter((id) => !before.includes(id)))];
+    const fresh = await freshMedia(page, before, kind);
     // New tiles are listed first, so anything beyond the requested count is not ours.
-    if (fresh.length >= count) return fresh.slice(0, count);
+    if (fresh.length >= count) {
+      const picked = fresh.slice(0, count);
+      // A video has no media id and is tracked by its title, which Flow may still change right after finishing: take
+      // it only once the same titles show twice running, or the download looks for a name that no longer exists.
+      const settled = !picked.some((id) => id.startsWith("title:")) || picked.join("|") === seen;
+      if (settled) return picked;
+      seen = picked.join("|");
+      if (job) job.progress = "Flow is finishing the video";
+      continue;
+    }
     const refusal = await newPolicyRefusal(page, before, TILE_ID_JS);
     if (refusal) throw new Error(`Flow rejected this prompt under its content policy. It was not retried. ${refusal}`);
     const progress = await page.evaluate(() =>
@@ -229,17 +310,41 @@ async function openSettings(page: Page): Promise<void> {
   if (!(await probe.isVisible().catch(() => false))) throw new Error("Could not open Flow's generation settings popover.");
 }
 
+// Image jobs use the newest Nano Banana unless another model is named (the user's call, 2026-10-13: "should always
+// default to latest"). The menu then held Nano Banana Pro, 2 Lite and 2.1 - the plain "Nano Banana 2" was gone, and
+// asking for it by name picked whichever came first. The newest is the highest version number that is not a Lite model,
+// read from Flow's own menu, so a later 2.2 or 3 is picked with no code change.
+export const LATEST_IMAGE_MODEL = "latest";
+const LEGACY_IMAGE_MODEL = /^\s*(nano banana( 2)?|latest)?\s*$/i;
+export function newestNanoBanana(names: string[]): number {
+  const version = (n: string) => /nano banana\s+(\d+(?:\.\d+)*)/i.exec(n)?.[1]?.split(".").map(Number);
+  let best = -1;
+  names.forEach((n, i) => {
+    const v = version(n);
+    if (!v || /\blite\b/i.test(n)) return;
+    const b = best < 0 ? undefined : version(names[best])!;
+    const newer = !b || v.some((x, k) => x !== (b[k] ?? 0) && v.slice(0, k).every((y, j) => y === (b[j] ?? 0)) && x > (b[k] ?? 0));
+    if (newer) best = i;
+  });
+  return best;
+}
+
 async function pickModel(page: Page, model: string): Promise<void> {
   const button = page.getByRole("button", { name: UI_NAMES.selectModel });
-  if ((await button.innerText()).toLowerCase().includes(model.toLowerCase())) return;
+  const latest = model === LATEST_IMAGE_MODEL;
+  if (!latest && (await button.innerText()).toLowerCase().includes(model.toLowerCase())) return;
   await button.click();
   const items = page.getByRole("menuitem");
   await items.first().waitFor({ state: "visible", timeout: 5000 });
   const names = (await items.allInnerTexts()).map((t) => t.replace(/\s+/g, " ").trim());
-  const index = names.findIndex((n) => n.toLowerCase().includes(model.toLowerCase()));
-  if (index < 0) {
+  const index = latest ? newestNanoBanana(names) : names.findIndex((n) => n.toLowerCase().includes(model.toLowerCase()));
+  const shown = (await button.innerText()).replace(/\s+/g, " ");
+  if (index < 0 || (latest && shown.includes(names[index]))) {
+    // Nothing to change (already the newest, or no numbered Nano Banana here at all): close the menu, pick nothing.
     await page.keyboard.press("Escape");
-    throw new Error(`Model "${model}" not found. Available here: ${names.join(", ")}`);
+    await clearBackdrops(page);
+    if (index < 0 && !latest) throw new Error(`Model "${model}" not found. Available here: ${names.join(", ")}`);
+    return;
   }
   await items.nth(index).click();
   await pause(page, 700);
@@ -253,8 +358,9 @@ async function applySettings(page: Page, job: Job): Promise<number> {
   await pickRadio(page, s.type === "image" ? "Image" : "Video");
   if (s.type === "video") await pickRadio(page, framesMode ? "Frames" : "Ingredients");
   if (s.aspect_ratio) await pickRadio(page, s.aspect_ratio);
-  if (s.model) await pickModel(page, s.model);
-  if (s.type === "video" && s.resolution) await pickRadio(page, new RegExp(`^${s.resolution}(?:\\s|$)`));
+  const model = s.type === "image" && LEGACY_IMAGE_MODEL.test(s.model ?? "") ? LATEST_IMAGE_MODEL : s.model;
+  if (model) await pickModel(page, model);
+  if (s.type === "video" && s.resolution) await pickRadio(page, new RegExp(`^${s.resolution}(?:\s|$)`));
   if (s.type === "video" && s.duration) await pickRadio(page, `${s.duration}s`);
   await pickRadio(page, `x${s.variants ?? 1}`);
   await pause(page, 600);
@@ -269,6 +375,19 @@ async function applySettings(page: Page, job: Job): Promise<number> {
 
 const ASSET_PREFIX = "asset:";
 
+// Waits for THIS upload by its own name until Flow has finished processing it (its picture carries a media id), so
+// a half-processed upload can never be taken for the next generation's result.
+async function waitForUpload(page: Page, name: string, timeoutMs: number): Promise<void> {
+  const tile = page.locator(`flow-grid-tile-container[aria-label="${name.replace(/"/g, '\\"')}"]:has([data-media-id])`);
+  await tile
+    .first()
+    .waitFor({ state: "attached", timeout: timeoutMs })
+    .catch(() => {
+      throw new Error(`Flow did not finish processing the upload "${name}" within ${Math.round(timeoutMs / 1000)}s.`);
+    });
+  await pause(page, 1000);
+}
+
 // Uploads under a unique filename so the asset can be picked unambiguously afterwards.
 // "asset:<name>" refers to something already in the Flow project (image, video, character) and skips the upload.
 async function uploadAsset(page: Page, job: Job, file: string, label: string): Promise<string> {
@@ -278,12 +397,11 @@ async function uploadAsset(page: Page, job: Job, file: string, label: string): P
   const staged = join(mkdtempSync(join(tmpdir(), "flow-mcp-")), name);
   copyFileSync(file, staged);
   await scrollToTop(page);
-  const before = await mediaIds(page);
   await page.getByRole("button", { name: UI_NAMES.addMediaMenu }).click();
   const chooser = page.waitForEvent("filechooser", { timeout: 10_000 });
   await page.getByRole("menuitem", { name: UI_NAMES.upload }).click();
   await (await chooser).setFiles(staged);
-  await waitForNewMedia(page, before, 1, 90_000);
+  await waitForUpload(page, name, 90_000);
   return name;
 }
 
@@ -295,11 +413,29 @@ const optionByName = (list: Locator, name: string) =>
 
 // Current frame and ingredient pickers preview first, then require "Add to prompt".
 // Option names are "<asset name>" or "<asset name> Image|Video", so match on the prefix.
-async function attachAsset(page: Page, opener: Locator, assetName: string): Promise<void> {
-  await opener.click();
-  // The opened picker has one visible listbox; its accessible name is localized.
-  // Keep strict matching so an ambiguous picker fails before attaching the wrong asset.
+export async function attachAsset(page: Page, opener: Locator, assetName: string): Promise<void> {
   const list = page.getByRole("listbox");
+  const all = page.getByRole("tab", { name: /^(?:All|Усі)$/ });
+  const shows = (l: Locator, ms: number) => l.waitFor({ state: "visible", timeout: ms }).then(() => true, () => false);
+  // Twice on 2026-10-09 (a character, then an uploaded still) the click on the opener produced no picker at all, and
+  // the job died waiting for it. It never reproduced when replayed, so it was something transient in the way - most
+  // likely the upload menu still closing. Like the settings popover, the picker gets three tries, with Escape in
+  // between to clear whatever caught the click. The Start/End frame pickers have no tabs, hence list OR All tab.
+  let opened = false;
+  for (let attempt = 0; attempt < 3 && !opened; attempt++) {
+    if (attempt) {
+      await page.keyboard.press("Escape");
+      await pause(page, 800);
+    }
+    await opener.click();
+    opened = await Promise.race([shows(list, 5000), shows(all, 5000)]);
+  }
+  if (!opened) throw new Error(`Flow's media picker did not open (three tries) while attaching "${assetName}". Nothing was generated.`);
+  // The picker reopens on whichever tab was used last (Characters, after a character), so start from All each time.
+  if ((await all.isVisible().catch(() => false)) && (await all.getAttribute("aria-selected")) !== "true") {
+    await all.click();
+    await pause(page, 1000);
+  }
   await list.waitFor({ state: "visible", timeout: 10_000 });
   let option = optionByName(list, assetName);
   // Long asset lists are virtualised: narrow them with the picker's search box first.
@@ -341,7 +477,12 @@ export async function downloadMedia(page: Page, mediaId: string, targetStem: str
   await scrollToTop(page);
   await pause(page, 2500);
   const tile = mediaTile(page, mediaId);
-  await tile.waitFor({ state: "visible", timeout: 30_000 });
+  await tile.waitFor({ state: "visible", timeout: 30_000 }).catch(() => {
+    throw new Error(
+      `The finished file is in Flow but could not be found again in the grid${mediaId.startsWith("title:") ? ` (looked for "${mediaId.slice(6)}")` : ""}. ` +
+        `Nothing is lost: flow_download fetches it by its title without spending credits again.`,
+    );
+  });
   // Grab the title NOW, while the id still resolves, so the download can re-find this exact tile later even if the
   // virtualised grid unmounts and remounts it between steps.
   const title = (await tile.getAttribute("aria-label").catch(() => null)) ?? undefined;
@@ -399,7 +540,9 @@ async function waitForDownloadedFile(page: Page, before: Set<string>, timeoutMs:
   const deadline = Date.now() + timeoutMs;
   let stable: { path: string; size: number } | undefined;
   while (Date.now() < deadline) {
-    await pause(page, 1000);
+    // Every quarter second: an image is there in well under a second, and a size that held still across two checks
+    // still proves Chrome has finished writing it.
+    await pause(page, 250);
     // Both places: ours, and Chrome's own folder for when the override has been reset behind our back.
     const candidates: string[] = [];
     for (const dir of [DOWNLOAD_DIR, SYSTEM_DOWNLOADS]) {
@@ -419,15 +562,15 @@ async function waitForDownloadedFile(page: Page, before: Set<string>, timeoutMs:
 }
 
 // Flow reveals a tile's controls on a genuine pointer move, so the mouse is driven to the tile itself.
-async function hoverTile(page: Page, tile: Locator): Promise<void> {
+async function hoverTile(page: Page, tile: Locator, settleMs = 900): Promise<void> {
   await tile.scrollIntoViewIfNeeded();
   const box = await tile.boundingBox();
   if (box) {
     await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
-    await pause(page, 900);
+    await pause(page, settleMs);
   } else {
     await tile.hover();
-    await pause(page, 900);
+    await pause(page, settleMs);
   }
 }
 
@@ -506,7 +649,7 @@ async function downloadTile(page: Page, target: Locator | TileResolver, targetSt
       const before = downloadsNow();
       // Flow only shows a tile's toolbar for a real pointer move over it - Playwright's hover() does not trigger it.
       // The toolbar's "More options" beats a right-click, which can land on the <video> and raise Chrome's own menu.
-      await hoverTile(page, tile);
+      await hoverTile(page, tile, 250);
       const download = await openTileDownloadMenu(page, tile);
       await download.click({ timeout: 10_000 });
       // Size submenu: "720p Original size" / "1K Original size", or the best upscale the plan allows.
@@ -538,14 +681,77 @@ async function downloadTile(page: Page, target: Locator | TileResolver, targetSt
   throw lastError;
 }
 
+// The left-hand "Project navigation" (All media, Images, Videos, Characters...). Its Collapse button (a setting Flow
+// keeps for every project) turns it into a strip of icons with no labels, and getByText("Characters") then found
+// nothing visible. Each item's text holds its icon name and its label whether or not the label shows, so it is found by
+// label in both states. (Why the menu used to vanish altogether: see leaveSideMenu.)
+async function clickProjectNav(page: Page, item: string): Promise<boolean> {
+  const button = page
+    .getByRole("navigation", { name: "Project navigation" })
+    .locator("button, a")
+    .filter({ hasText: new RegExp(`${item}\\s*$`) })
+    .first();
+  if (!(await button.isVisible().catch(() => false))) return false;
+  await button.click({ timeout: 5000 });
+  await leaveSideMenu(page);
+  return true;
+}
+
+// The left-hand menu is a Material drawer, and Escape shuts it whenever the keyboard focus is inside it. Clicking
+// "All media" left the focus there, so the very next Escape (dismissOverlays runs before almost every step) shut the
+// menu for the rest of the session: the user's menu vanished, "All media" was hidden from then on, and each later click
+// on it waited out Playwright's 30 s default (traced with DEBUG=pw:api, 2026-10-13). Take the focus out first.
+async function leaveSideMenu(page: Page): Promise<void> {
+  await page
+    .evaluate(() => {
+      const focused = document.activeElement as HTMLElement | null;
+      if (focused?.closest("mat-sidenav")) focused.blur();
+    })
+    .catch(() => {});
+}
+async function openProjectNav(page: Page, item: string): Promise<void> {
+  if (await clickProjectNav(page, item)) return;
+  // A page load shows the menu again in whatever state the user keeps it, and changes nothing about that choice.
+  await page.goto(inEnglish(page.url()), { waitUntil: "domcontentloaded" });
+  await pause(page, 3000);
+  if (!(await clickProjectNav(page, item))) throw new Error(`Flow's left-hand menu is not showing, so "${item}" could not be opened. Show the menu in the Flow window and try again.`);
+}
+
+// All media: through the left-hand menu when it shows. When it does not (collapsed and scrolled away), the top bar's
+// Filter menu does the same job: nothing ticked, newest first. `thorough` (the start of a job) checks that menu; a
+// plain grid scan does not, so a hidden menu costs nothing.
+async function showAllMedia(page: Page, thorough = false): Promise<void> {
+  if (await clickProjectNav(page, "All media").catch(() => false)) return;
+  // Ukrainian UI: the same button, found by its localized name.
+  if (await allMediaControl(page).click({ timeout: 3000 }).then(() => true, () => false)) return;
+  const filter = page.getByRole("button", { name: "Filtering and sorting options" });
+  if (!thorough || !(await filter.isVisible().catch(() => false))) return;
+  await filter.click({ timeout: 5000 }).catch(() => {});
+  await pause(page, 600);
+  const menu = page.locator(".cdk-overlay-container");
+  if (await menu.locator("input[type=checkbox]:checked").count().catch(() => 0)) {
+    await page.getByRole("button", { name: "Clear all filters" }).click({ timeout: 4000 }).catch(() => {});
+    await pause(page, 600);
+  }
+  // New tiles must come first: everything that finds a fresh result looks at the top of the grid.
+  const newest = menu.locator("label", { hasText: /^\s*Newest\s*$/ }).locator("input[type=radio]");
+  if ((await newest.count().catch(() => 0)) && !(await newest.first().isChecked().catch(() => true))) {
+    await newest.first().click({ force: true, timeout: 4000 }).catch(() => {});
+    await pause(page, 600);
+  }
+  await page.keyboard.press("Escape");
+  await clearBackdrops(page);
+}
+
 async function ensureProjectGrid(page: Page): Promise<void> {
   await dismissOverlays(page);
   const root = page.url().match(/^https:\/\/[^/]+\/project\/[0-9a-f-]{36}/)?.[0];
-  if (root && page.url() !== `${root}?hl=en`) {
-    await page.goto(`${root}?hl=en`, { waitUntil: "domcontentloaded" });
+  // Compared by path: an address ending in ?hl=en is already the grid.
+  if (root && new URL(page.url()).pathname !== new URL(root).pathname) {
+    await page.goto(inEnglish(root), { waitUntil: "domcontentloaded" });
     await pause(page, 2500);
   }
-  await allMediaControl(page).click().catch(() => {});
+  await showAllMedia(page, true);
   await pause(page, 800);
   await scrollToTop(page);
 }
@@ -602,7 +808,7 @@ export async function runGeneration(job: Job): Promise<string[]> {
   await start.click();
 
   const variants = s.variants ?? 1;
-  const fresh = await waitForNewMedia(page, before, variants, s.type === "image" ? IMAGE_TIMEOUT_MS : VIDEO_TIMEOUT_MS, job);
+  const fresh = await waitForNewMedia(page, before, variants, s.type === "image" ? IMAGE_TIMEOUT_MS : VIDEO_TIMEOUT_MS, job, s.type === "image" ? "image" : "video");
   job.progress = undefined;
 
   mkdirSync(s.output_dir, { recursive: true });
@@ -612,11 +818,16 @@ export async function runGeneration(job: Job): Promise<string[]> {
     // Flow names clips itself and reuses those names, so two takes of one scene come back identically titled and
     // neither can be found by name afterwards. Renaming each finished tile to the scene's own file stem makes every
     // later lookup - download, continue, assemble - unambiguous. Best effort: a failed rename must not lose the clip.
-    const renamed = await renameTile(page, mediaTile(page, id), `${basename(s.output_dir)}-${label}`).catch(() => false);
-    if (renamed) job.note = [job.note, `renamed in Flow to ${basename(s.output_dir)}-${label}`].filter(Boolean).join(" · ");
+    const newTitle = `${basename(s.output_dir)}-${label}`;
+    const renamed = await renameTile(page, mediaTile(page, id), newTitle).catch(() => false);
+    if (renamed) job.note = [job.note, `renamed in Flow to ${newTitle}`].filter(Boolean).join(" · ");
     await pause(page, 800);
     const stem = join(s.output_dir, label);
-    files.push(...(await downloadMedia(page, id, stem, s.download_quality)));
+    // A video at rest has no media id, so it is tracked by its title - which the rename just changed. Looking for the
+    // old title failed every such download after 30 s ("locator.waitFor: Timeout 30000ms exceeded ... aria-label=
+    // <the prompt>", reported by a user, 2026-10-15) while the clip sat finished and renamed in Flow.
+    const handle = renamed && id.startsWith("title:") ? `title:${newTitle}` : id;
+    files.push(...(await downloadMedia(page, handle, stem, s.download_quality)));
     await pause(page, 1500);
   }
   return files;
@@ -632,7 +843,7 @@ export interface FlowAsset {
 // media id yet, so entries are keyed by title and the id is filled in from whichever pass saw it.
 async function scanGrid(page: Page, stopAt?: (assets: FlowAsset[]) => boolean): Promise<FlowAsset[]> {
   await dismissOverlays(page);
-  await allMediaControl(page).click().catch(() => {});
+  await showAllMedia(page);
   await pause(page, 600);
   await scrollToTop(page);
   const seen = new Map<string, FlowAsset>();
@@ -675,7 +886,7 @@ export async function listCharacters(): Promise<string[]> {
   if (!state.signedIn || !state.inProject) throw new Error(state.hint);
   const page = await getFlowPage();
   await dismissOverlays(page);
-  await page.getByRole("navigation", { name: "Project navigation" }).getByText("Characters", { exact: true }).click();
+  await openProjectNav(page, "Characters");
   await pause(page, 2500);
   const names = await page.evaluate(() =>
     [...document.querySelectorAll("flow-character-tile")].map((t) => (t as HTMLElement).innerText.replace(/\s+/g, " ").trim()).filter(Boolean),
@@ -732,7 +943,7 @@ export async function editCharacter(name: string, change?: string, job?: Job): P
   const page = await getFlowPage();
   await leaveCharacterEditor(page);
   await dismissOverlays(page);
-  await page.getByRole("navigation", { name: "Project navigation" }).getByText("Characters", { exact: true }).click();
+  await openProjectNav(page, "Characters");
   await pause(page, 2500);
 
   const card = page.locator("flow-character-tile").filter({ hasText: name }).first();
@@ -791,6 +1002,9 @@ export async function listAssets(): Promise<FlowAsset[]> {
   const state = await getFlowState();
   if (!state.signedIn || !state.inProject) throw new Error(state.hint);
   const page = await getFlowPage();
+  // From a scene, clip or character view the grid is not on screen, and the scan found nothing at all (2026-10-12:
+  // a scene open in Flow listed as "no scenes"). Go back to the project's All media first.
+  await ensureProjectGrid(page);
   const assets = await scanGrid(page);
   await scrollToTop(page);
   return assets;
@@ -801,6 +1015,7 @@ export async function downloadAsset(name: string, targetStem: string, quality: D
   const state = await getFlowState();
   if (!state.signedIn || !state.inProject) throw new Error(state.hint);
   const page = await getFlowPage();
+  await ensureProjectGrid(page);
   const matches = (a: FlowAsset) => a.name.toLowerCase().startsWith(name.toLowerCase());
   const found = (await scanGrid(page, (assets) => assets.some(matches))).find(matches);
   if (!found) throw new Error(`No asset whose title starts with "${name}". Use flow_assets to list titles.`);
@@ -812,6 +1027,38 @@ export async function downloadAsset(name: string, targetStem: string, quality: D
 // is recoverable - and it never deletes permanently. Flow asks NO confirmation (mapped 2026-10-01: the tile menu's
 // "Move to trash" removes the tile at once), so whoever calls this must confirm with the user first. Matching is by
 // EXACT title, and an ambiguous title is refused: Flow reuses titles, and trashing the wrong one is the worst outcome.
+// How many tiles carry this exact title. scanGrid keeps one entry per title (the virtual grid shows the same tile again
+// as it scrolls), so it can never see two items with the same name: trashAsset's "two share it" guard never fired,
+// and Flow's agent reuses titles freely (three "Red fox sitting in snow" in one test, 2026-10-18). Images are told apart
+// by their media ids; id-less videos only when two of them are on screen together.
+async function countTitled(page: Page, name: string): Promise<number> {
+  await scrollToTop(page);
+  const ids = new Set<string>();
+  let together = 0;
+  for (let step = 0; step < 200; step++) {
+    const found = await page.evaluate(
+      ([js, title]) => {
+        const idOf = eval(js) as (t: Element) => string | undefined;
+        return [...document.querySelectorAll("flow-grid-tile-container")].filter((t) => t.getAttribute("aria-label") === title).map((t) => idOf(t) ?? "");
+      },
+      [TILE_ID_JS, name] as const,
+    );
+    together = Math.max(together, found.length);
+    for (const id of found) if (id && !id.startsWith("title:")) ids.add(id);
+    const moved = await page.evaluate(() => {
+      const el = document.querySelector(".page-container");
+      if (!el) return false;
+      const before = el.scrollTop;
+      el.scrollTop = before + el.clientHeight * 0.8;
+      return el.scrollTop > before;
+    });
+    if (!moved) break;
+    await pause(page, 500);
+  }
+  await scrollToTop(page);
+  return Math.max(ids.size, together);
+}
+
 export async function trashAsset(name: string): Promise<{ trashed: string }> {
   const state = await getFlowState();
   if (!state.signedIn || !state.inProject) throw new Error(state.hint);
@@ -819,7 +1066,8 @@ export async function trashAsset(name: string): Promise<{ trashed: string }> {
   await ensureProjectGrid(page);
   const same = (await scanGrid(page)).filter((a) => a.name === name);
   if (!same.length) throw new Error(`Nothing in the open project is called "${name}".`);
-  if (same.length > 1) throw new Error(`${same.length} items are called "${name}", so it isn't clear which one to trash. Rename one in Flow first.`);
+  const copies = await countTitled(page, name);
+  if (copies > 1) throw new Error(`${copies} items are called "${name}", so it isn't clear which one to trash. Rename one in Flow first.`);
   // Scan again, stopping on the tile so it stays mounted in the virtual grid (no scrollToTop before acting on it).
   await scanGrid(page, (seen) => seen.some((a) => a.name === name));
   const tile = tileOf(page, same[0]);
@@ -914,7 +1162,7 @@ export async function createCharacter(c: CharacterParams, job?: Job): Promise<{ 
   await dismissOverlays(page);
   await scrollToTop(page);
 
-  await page.getByRole("navigation", { name: "Project navigation" }).getByText("Characters", { exact: true }).click();
+  await openProjectNav(page, "Characters");
   await pause(page, 1500);
   // With no characters yet Flow jumps straight to the creation page.
   const create = page.getByRole("button", { name: "New character" });
@@ -971,12 +1219,12 @@ export async function createCharacter(c: CharacterParams, job?: Job): Promise<{ 
 
   // Flow labels this "Done editing" or just "Done" depending on the panel state.
   await page.getByRole("button", { name: /^Done( editing)?$/ }).first().click();
-  await page.waitForURL((u) => !/\/character/.test(u.pathname), { timeout: 15_000 }).catch(() => page.goto(`${projectUrl.split("?")[0]}?hl=en`));
+  await page.waitForURL((u) => !/\/character/.test(u.pathname), { timeout: 15_000 }).catch(() => page.goto(inEnglish(projectUrl)));
   await pause(page, 1000);
   // Flow drops the new character into the composer; leave the composer empty for the next job.
   const clear = page.getByRole("button", { name: UI_NAMES.clearPrompt });
   if (await clear.isVisible().catch(() => false)) await clear.click();
-  await allMediaControl(page).click().catch(() => {});
+  await showAllMedia(page);
   if (c.describe) rememberCharacter(c.name, c.describe);
   return { name: c.name, url, portrait };
 }
@@ -1037,7 +1285,7 @@ export async function runEdit(job: Job): Promise<string[]> {
   await page.getByRole("button", { name: "Back button to go to previous page" }).click();
   await pause(page, 2500);
   await ensureProjectGrid(page);
-  const fresh = await waitForNewMedia(page, before, 1, 90_000);
+  const fresh = await waitForNewMedia(page, before, 1, 90_000, undefined, "video");
   mkdirSync(s.output_dir, { recursive: true });
   const saved = await downloadMedia(page, fresh[0], join(s.output_dir, s.file_stem), s.download_quality);
   const after = await readCredits(page).catch(() => undefined);
@@ -1045,18 +1293,51 @@ export async function runEdit(job: Job): Promise<string[]> {
   return saved;
 }
 
+// The agent session panel hides the composer, so a toggle attempted underneath it does nothing at all. Leaving agent
+// mode on then breaks the NEXT job, which expects the plain composer - a free character build failed that way. So this
+// confirms the toggle actually landed rather than assuming the click worked.
+async function setAgentMode(page: Page, on: boolean): Promise<void> {
+  // Agent is a button in the English UI and a checkbox in the Ukrainian one: agentModeToggle finds either.
+  const agent = agentModeToggle(page);
+  // Playwright says why a click did not land ("<div ...> intercepts pointer events", "element is not visible"); keep
+  // that, so a failure names what was in the way instead of guessing.
+  let why = "";
+  for (let attempt = 0; attempt < 3; attempt++) {
+    await clearBackdrops(page);
+    await closeAgentSettings(page);
+    if ((await agentModeEnabled(agent).catch(() => !on)) === on) return;
+    await agent.click({ timeout: 8000 }).catch((err: Error) => {
+      const lines = err.message.split("\n").map((l) => l.trim());
+      why = (lines.find((l) => /intercepts pointer events|not visible|not enabled|detached|not stable/.test(l)) ?? lines[0]).slice(0, 200);
+    });
+    await pause(page, 1500);
+  }
+  if ((await agentModeEnabled(agent).catch(() => !on)) !== on) {
+    throw new Error(`Could not switch Agent mode ${on ? "on" : "off"}${why ? ` (${why})` : "; the click landed but the toggle did not change"}.`);
+  }
+}
+
 // "Never" lets the agent generate without asking; it is switched back to "Always" as soon as the batch ends.
 async function setAgentSettings(page: Page, confirm: "Always" | "Never", imageAspect?: string): Promise<void> {
-  await page.getByRole("button", { name: UI_NAMES.settings, exact: true }).click();
-  await page.getByRole("heading", { name: "Agent settings" }).waitFor({ state: "visible", timeout: 8000 });
-  await page.getByRole("radio", { name: new RegExp(`^${confirm}`) }).click();
-  if (imageAspect) {
-    await page.getByRole("radio", { name: imageAspect, exact: true }).first().click();
-    await page.getByRole("radio", { name: "x1", exact: true }).first().click();
+  // Scoped to the prompt box: Flow added a second "Settings" button to the top bar ("View settings", seen 2026-10-13),
+  // and an unscoped lookup matched both and failed every agent batch.
+  await clearBackdrops(page);
+  await page.locator("flow-base-prompt-box").getByRole("button", { name: UI_NAMES.settings }).click();
+  try {
+    await page.getByRole("heading", { name: "Agent settings" }).waitFor({ state: "visible", timeout: 8000 });
+    await page.getByRole("radio", { name: new RegExp(`^${confirm}`) }).click();
+    if (imageAspect) {
+      await page.getByRole("radio", { name: imageAspect, exact: true }).first().click();
+      await page.getByRole("radio", { name: "x1", exact: true }).first().click();
+      await pickAgentImageModel(page);
+    }
+    await pause(page, 300);
+    await page.getByRole("button", { name: "Save", exact: true }).click();
+    await pause(page, 1200);
+  } finally {
+    // Saved or not, never leave the panel covering the composer: the next step needs the Agent button.
+    await closeAgentSettings(page);
   }
-  await pause(page, 300);
-  await page.getByRole("button", { name: "Save", exact: true }).click();
-  await pause(page, 1200);
 }
 
 // "Reuse prompt" on an agent-made tile opens the agent's session panel, which hides the normal composer.
@@ -1113,6 +1394,19 @@ interface RoundOutcome {
 
 // One pass through Flow's agent for the given scene numbers: ask, wait, match the new tiles back to those scenes
 // and download them. Returns how many scenes it actually delivered.
+// Bulk downloads go at an even, human pace: as quick as the steps allow (about 2.5 s), then held to a random 4-4.4 s each
+// (the user's call, 2026-10-19), in the spirit of the random pauses between generations. Before, each took ~5.6 s.
+const downloadPace = () => 4000 + Math.random() * 400;
+
+// Progress the panel and flow_wait show; with FLOW_MCP_DEBUG set, also a timed line on stderr to find slow steps.
+const t0s = new WeakMap<Job, number>();
+function step(job: Job, text: string | undefined): void {
+  job.progress = text;
+  if (!process.env.FLOW_MCP_DEBUG || !text) return;
+  if (!t0s.has(job)) t0s.set(job, Date.now());
+  console.error(`[flow-mcp ${job.id}] ${((Date.now() - t0s.get(job)!) / 1000).toFixed(1)}s ${text}`);
+}
+
 async function agentRound(
   page: Page,
   job: Job,
@@ -1124,6 +1418,8 @@ async function agentRound(
 ): Promise<RoundOutcome> {
   const s = job.params;
   const aspect = s.aspect_ratio ?? "16:9";
+  const base = Number(s.file_stem.match(/\d+/)?.[0] ?? 1);
+  const numberOf = (i: number) => s.agent_numbers?.[i] ?? base + i;
   await ensureProjectGrid(page);
   const seenBefore = await scanGrid(page);
   // Ids are unique per generation; titles are not (the agent reuses wording), so only id-less tiles fall back to a name.
@@ -1133,11 +1429,36 @@ async function agentRound(
 
   const clear = page.getByRole("button", { name: UI_NAMES.clearPrompt });
   if (await clear.isVisible().catch(() => false)) await clear.click();
-  const script = indexes.map((i) => `Scene ${i + 1}: ${scenes[i].replace(/\s*\n+\s*/g, " ").trim()}`).join(" ");
+  // Reference images ride along as ingredient chips, attached the way the + button does, once per round (the composer
+  // is cleared between rounds). The script then names them, and each scene says which ones it uses.
+  const refs = s.agent_refs ?? [];
+  const assets = s.agent_ref_assets ?? [];
+  if (refs.length) {
+    for (const [k, name] of assets.entries()) {
+      step(job, `attaching reference ${k + 1} of ${assets.length}`);
+      await attachAsset(page, page.getByRole("button", { name: "Add ingredients to the prompt box" }), name);
+      await pause(page, 700);
+    }
+    const attached = await page.getByRole("button", { name: "Ingredient" }).count();
+    if (attached < assets.length) throw new Error(`Only ${attached} of ${assets.length} reference image(s) attached in the agent composer.`);
+  }
+  const usesOf = (i: number) => s.agent_scene_refs?.[i];
+  const script = indexes
+    .map((i) => {
+      const uses = usesOf(i);
+      const tag = !refs.length || !uses ? "" : uses.length ? ` (use references: ${uses.join(", ")})` : " (no reference)";
+      return `Scene ${numberOf(i)}${tag}: ${scenes[i].replace(/\s*\n+\s*/g, " ").trim()}`;
+    })
+    .join(" ");
+  const legend = refs.length
+    ? ` The ${refs.length} attached image(s) are references: ${refs.map((r, k) => `${assets[k] ?? `image ${k + 1}`} is ${r.name}`).join("; ")}. ` +
+      `Whenever a scene shows one of them, keep it exactly as it looks in its reference (face, hair, clothing, shape, colours), ` +
+      `but stage each scene as its own description says; the references are for likeness only, never copy their pose or background.`
+    : "";
   const lead = retry
     ? `${indexes.length} image(s) from the last batch failed to generate. Generate them again now, one image per scene`
     : `Generate exactly ${indexes.length} separate images, one image per scene, in scene order`;
-  const ask = `${lead}. Images only, never video. ${aspect} aspect ratio. Do not ask questions, generate them now. ${script}`;
+  const ask = `${lead}. Images only, never video. ${aspect} aspect ratio. Do not ask questions, generate them now.${legend} ${script}`;
   await page.locator(".ProseMirror").first().click();
   await page.keyboard.insertText(ask);
   await pause(page, 800);
@@ -1155,7 +1476,7 @@ async function agentRound(
     const main = await page.locator("main").first().innerText();
     const pending = main.match(/\d+%/g) ?? [];
     const working = pending.length > 0 || (await stop.isVisible().catch(() => false));
-    job.progress = working ? `${pending.length} rendering` : undefined;
+    step(job, working ? (pending.length ? `${pending.length} rendering` : "the agent is working") : "the agent has finished");
     if (working) idleSince = 0;
     else if (!idleSince) idleSince = Date.now();
     else if (Date.now() - idleSince > 8000) break;
@@ -1168,6 +1489,7 @@ async function agentRound(
     }
   }
 
+  step(job, "checking for failed tiles");
   const failedTiles = await retryNewErrorTiles(page, before, true)
     .then((r) => r.errors)
     .catch(() => 0);
@@ -1176,7 +1498,8 @@ async function agentRound(
   // Tiles finish in any order and the agent rewords prompts, so each image is matched back to its scene by the
   // prompt Flow stored for it ("Reuse prompt" puts that text in the composer).
   const prompts: string[] = [];
-  for (const tile of fresh) {
+  for (const [k, tile] of fresh.entries()) {
+    step(job, `matching image ${k + 1} of ${fresh.length} to its scene`);
     await scanGrid(page, (seen) => seen.some((x) => x.id === tile.id));
     const el = mediaTile(page, tile.id!);
     await el.scrollIntoViewIfNeeded();
@@ -1193,17 +1516,19 @@ async function agentRound(
   );
   const drop = Number(process.env.FLOW_MCP_SIMULATE_MISSING ?? 0); // test hook: pretend this scene number failed
   mkdirSync(s.output_dir, { recursive: true });
-  const base = Number(s.file_stem.match(/\d+/)?.[0] ?? 1);
   let produced = 0;
   for (const [n, tileIndexes] of assigned.entries()) {
     const sceneIndex = indexes[n];
-    if (!tileIndexes.length || sceneIndex + 1 === drop) continue;
+    if (!tileIndexes.length || (numberOf(sceneIndex) === drop && !s.agent_numbers)) continue;
     for (const [v, tileIndex] of tileIndexes.entries()) {
       const id = fresh[tileIndex].id!;
-      await scanGrid(page, (seen) => seen.some((x) => x.id === id));
-      const stem = join(s.output_dir, `scene-${String(base + sceneIndex).padStart(2, "0")}${v ? `-v${v + 1}` : ""}`);
+      const started = Date.now();
+      // New tiles sit at the top of the grid, so a scan is only needed when this one has scrolled out of the page.
+      if (!(await mediaTile(page, id).count())) await scanGrid(page, (seen) => seen.some((x) => x.id === id));
+      const stem = join(s.output_dir, `scene-${String(numberOf(sceneIndex)).padStart(2, "0")}${v ? `-v${v + 1}` : ""}`);
+      step(job, `downloading scene ${numberOf(sceneIndex)}`);
       files.push(...(await downloadTile(page, mediaTile(page, id), stem, s.download_quality ?? "original")));
-      await pause(page, 800);
+      await pause(page, Math.max(0, downloadPace() - (Date.now() - started)));
     }
     done.add(sceneIndex);
     produced++;
@@ -1309,7 +1634,7 @@ export async function runContinue(job: Job): Promise<string[]> {
       break;
     }
 
-    const fresh = await waitForNewMedia(page, before, 1, VIDEO_TIMEOUT_MS, job);
+    const fresh = await waitForNewMedia(page, before, 1, VIDEO_TIMEOUT_MS, job, "video");
     job.progress = undefined;
     mkdirSync(s.output_dir, { recursive: true });
     const saved = await downloadMedia(page, fresh[0], join(s.output_dir, s.file_stem), s.download_quality);
@@ -1344,8 +1669,22 @@ export async function runAgentBatch(job: Job): Promise<string[]> {
   let agentTimedOut = false;
   let failedTiles = 0;
   let agentRetries = 0;
+  let agentProblem = "";
   try {
+    // References are uploaded once with readable names (the agent sees them), before Agent mode hides the upload menu.
+    if (s.agent_refs?.length && !s.agent_ref_assets?.length) {
+      await setAgentMode(page, false);
+      const assets: string[] = [];
+      for (const [k, r] of s.agent_refs.entries()) {
+        step(job, `uploading reference ${k + 1} of ${s.agent_refs.length} (${r.name})`);
+        const label = r.name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 24) || `ref${k + 1}`;
+        assets.push(await uploadAsset(page, job, r.image, label));
+      }
+      s.agent_ref_assets = assets;
+    }
+    step(job, "switching Agent mode on");
     await setAgentMode(page, true);
+    step(job, "setting the agent to generate without asking");
     await setAgentSettings(page, "Never", s.aspect_ratio ?? "16:9");
     for (let round = 0; round < 3; round++) {
       const todo = scenes.map((_, i) => i).filter((i) => !done.has(i));
@@ -1359,7 +1698,13 @@ export async function runAgentBatch(job: Job): Promise<string[]> {
       failedTiles = out.failedTiles;
       if (!out.produced) break; // the agent delivered nothing this round: stop asking it
     }
+  } catch (err) {
+    // Agent mode could not be used (2026-10-13: "Could not switch Agent mode on" failed a whole 11-image batch with
+    // nothing made). Whatever the agent did not deliver is made one by one below instead: slower, but the batch still
+    // ends with every image.
+    agentProblem = (err as Error).message;
   } finally {
+    step(job, "putting the agent settings back");
     await ensureProjectGrid(page).catch(() => {});
     await closeAgentSession(page).catch(() => {});
     await setAgentMode(page, true).catch(() => {});
@@ -1371,8 +1716,25 @@ export async function runAgentBatch(job: Job): Promise<string[]> {
   const missing = scenes.map((_, i) => i).filter((i) => !done.has(i));
   const failed: number[] = [];
   const base = Number(s.file_stem.match(/\d+/)?.[0] ?? 1);
+  const numberOf = (i: number) => s.agent_numbers?.[i] ?? base + i;
+  const stillFails = Number(process.env.FLOW_MCP_SIMULATE_FAILED ?? 0); // test hook: pretend this scene failed for good
+  // A scene made one by one keeps its references: the uploaded copies when there are some, else the original files.
+  const refsFor = (i: number): string[] | undefined => {
+    const refs = s.agent_refs ?? [];
+    if (!refs.length) return undefined;
+    const uses = s.agent_scene_refs?.[i];
+    const picked = refs
+      .map((r, k) => ({ r, k }))
+      .filter(({ r }) => !uses || uses.some((u) => u.toLowerCase() === r.name.toLowerCase()))
+      .slice(0, 3);
+    return picked.length ? picked.map(({ r, k }) => (s.agent_ref_assets?.[k] ? `${ASSET_PREFIX}${s.agent_ref_assets[k]}` : r.image)) : undefined;
+  };
   for (const [n, i] of missing.entries()) {
-    job.progress = `re-running scene ${i + 1} one by one (${n + 1}/${missing.length})`;
+    job.progress = `re-running scene ${numberOf(i)} one by one (${n + 1}/${missing.length})`;
+    if (numberOf(i) === stillFails && !job.params.agent_numbers) {
+      failed.push(numberOf(i));
+      continue;
+    }
     const single: Job = {
       ...job,
       files: [],
@@ -1380,10 +1742,11 @@ export async function runAgentBatch(job: Job): Promise<string[]> {
         prompt: scenes[i],
         type: "image",
         max_credits: 0,
+        reference_images: refsFor(i),
         aspect_ratio: s.aspect_ratio,
         download_quality: s.download_quality,
         output_dir: s.output_dir,
-        file_stem: `scene-${String(base + i).padStart(2, "0")}`,
+        file_stem: `scene-${String(numberOf(i)).padStart(2, "0")}`,
       },
     };
     let ok = false;
@@ -1396,23 +1759,28 @@ export async function runAgentBatch(job: Job): Promise<string[]> {
         /* one more attempt, then give up on this scene */
       }
     }
-    if (!ok) failed.push(i + 1);
+    if (!ok) failed.push(numberOf(i));
   }
-  job.progress = undefined;
+  job.failed_scenes = failed.length ? failed : undefined;
+  step(job, "reading the credit balance");
+  const left = await readCredits(page).catch(() => undefined);
+  step(job, undefined);
   files.sort();
   job.note = [
+    // What still needs doing first: the panel shows only the start of a long note.
+    failed.length ? `still failed: scene ${failed.join(", ")} (use Retry)` : "",
+    agentProblem ? `agent mode failed (${agentProblem}), so the images were made one by one` : "",
     agentTimedOut ? "the agent stalled and was stopped" : "",
     `${done.size} of ${scenes.length} scenes came from the agent`,
+    s.agent_refs?.length ? `${s.agent_refs.length} reference image(s) attached` : "",
     agentRetries ? `${agentRetries} asked again` : "",
     failedTiles ? `${failedTiles} tile(s) failed in Flow` : "",
-    missing.length ? `${missing.length - failed.length} re-run one by one` : "",
-    failed.length ? `still failed: scene ${failed.join(", ")} (use Retry)` : "",
+    missing.length > failed.length ? `${missing.length - failed.length} re-run one by one` : "",
   ]
     .filter(Boolean)
     .join(" · ");
   if (!files.length) throw new Error("No image could be generated for any scene. Open the Flow tab to see what Flow reported.");
 
-  const left = await readCredits(page).catch(() => undefined);
   if (balance !== undefined && left !== undefined) job.credits = balance - left;
   return files;
 }
