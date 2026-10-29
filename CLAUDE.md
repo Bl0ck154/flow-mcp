@@ -10,6 +10,8 @@ OmniFlow (lingoflow.pro/omniflow), using subscription credits instead of the API
 - `studio/index.html` Studio UI (single file, vanilla JS, mobile-first) · `src/chain.ts`, `src/assemble.ts` ffmpeg ·
   `src/techniques.ts` presets · `src/playbook.ts` guidance returned by `flow_status`
 - Test: `node scripts/e2e.mjs <project> '<scenes json>'` (spends credits unless scenes are images)
+- Safe regression checks: `npm test` builds, exercises isolated HTML fixtures in a fresh headless Chrome,
+  and discovers tools on a disposable MCP server. It never connects to the user's browser or submits Flow jobs.
 
 ## Rules
 
@@ -23,6 +25,24 @@ OmniFlow (lingoflow.pro/omniflow), using subscription credits instead of the API
   feature in, rebuild, then carry on with the user's actual request.
 
 ## Flow UI map (verified 2026-09-19, flow.google.com, Pro plan)
+
+- Compatibility repair (2026-10-14): the Ukrainian UI exposes Agent as checkbox `Агент`, rather than
+  the old `Agent` button. `src/flow-ui.ts` supports both names and roles, reads native `checked`,
+  `aria-checked`, or `aria-pressed`, and verifies the result. Requested video resolution is explicitly
+  selected and verified after other settings; failure stops before submission. Tile menus now wait
+  for Download to appear and try a context click if the toolbar opened nothing. Further localized
+  selector names require a fresh live UI map; do not guess translations. The subsequent live map verified
+  Ukrainian composer, account, all-media, model/type/duration/credit settings, and tile download/rename
+  names now in `UI_NAMES`. Ukrainian durations use `4 с` etc.; quotes use `стільки кредитів: N`.
+  Download submenu labels are `Оригінальний розмір` and `Підвищена роздільна здатність`;
+  offered upscale resolution depends on the asset (a 360p video offered 720p), so never assume 1080p.
+  Frame picker mapping: `Початок` / `Кінець`, uploads tab `Додані файли`, confirmation `Додати до запиту`;
+  current frame pickers preview first and require confirmation. `completeAssetSelection` confirms and waits
+  for the picker to close, while retaining compatibility with older immediate attachment. Upload menuitem
+  is `Завантажити` (same word as Download). Attachment uses the unique visible listbox role.
+  Completion now filters out titled placeholders with no img/video src, progress percentages,
+  and `flow-error-tile` before returning fresh IDs. Previously an aria-label alone could make
+  generation return early and try downloading a tile whose menu still offered only Delete.
 
 - Flow lives at `flow.google.com/project/<uuid>`; signed-out redirects to `/about`.
 - Composer: prompt box is `.ProseMirror`; Enter submits. Buttons by accessible name: `Agent` (toggle,

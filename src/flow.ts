@@ -5,6 +5,7 @@ import type { Locator, Page } from "playwright-core";
 import { HOME_DIR, getFlowPage } from "./chrome.js";
 import type { Job } from "./queue.js";
 import { extractZip } from "./platform.js";
+import { allMediaControl, completedMediaIds, completeAssetSelection, UI_NAMES, newPolicyRefusal, openTileDownloadMenu, pickRadio, setAgentMode, verifyResolution } from "./flow-ui.js";
 
 export interface FlowState {
   url: string;
@@ -33,7 +34,7 @@ export async function getFlowState(detailed = false): Promise<FlowState> {
   if (!signedIn) state.hint = "Not signed in. Run `npm run login` and sign in to Google in the Flow Chrome window.";
   else if (!inProject) state.hint = "Signed in, but no project is open. Open or create a project in the Flow Chrome window.";
   else if (detailed) {
-    state.plan = await page.getByRole("button", { name: "Account details" }).innerText().then((t) => t.trim().split("\n")[0], () => undefined);
+    state.plan = await page.getByRole("button", { name: UI_NAMES.accountDetails }).innerText().then((t) => t.trim().split("\n")[0], () => undefined);
     state.credits_remaining = await readCredits(page).catch(() => undefined);
     state.composer = await settingsTrigger(page).innerText().then((t) => t.replace(/\s+/g, " ").trim(), () => undefined);
   }
@@ -43,7 +44,7 @@ export async function getFlowState(detailed = false): Promise<FlowState> {
 // Menus close on Escape; the account panel does not and needs its own close button.
 async function dismissOverlays(page: Page): Promise<void> {
   await page.keyboard.press("Escape");
-  const closePanel = page.getByRole("button", { name: "Close account panel" });
+  const closePanel = page.getByRole("button", { name: UI_NAMES.closeAccountPanel });
   if (await closePanel.isVisible().catch(() => false)) await closePanel.click({ timeout: 5000 }).catch(() => {});
 }
 
@@ -51,8 +52,8 @@ async function dismissOverlays(page: Page): Promise<void> {
 async function readCredits(page: Page): Promise<number | undefined> {
   await dismissOverlays(page);
   await scrollToTop(page);
-  await page.getByRole("button", { name: "Account details" }).click({ timeout: 5000 });
-  const link = page.getByRole("link", { name: /Google Flow credits/ });
+  await page.getByRole("button", { name: UI_NAMES.accountDetails }).click({ timeout: 5000 });
+  const link = page.getByRole("link", { name: UI_NAMES.creditBalance });
   try {
     await link.waitFor({ state: "visible", timeout: 5000 });
     const n = Number((await link.innerText()).replace(/[^\d]/g, ""));
@@ -63,7 +64,7 @@ async function readCredits(page: Page): Promise<number | undefined> {
   }
 }
 
-const settingsTrigger = (page: Page) => page.getByRole("button", { name: "Settings trigger" });
+const settingsTrigger = (page: Page) => page.getByRole("button", { name: UI_NAMES.settingsTrigger });
 
 // Every finished tile carries its media id in data-media-id; some thumbnails also have it in the URL, but Flow
 // serves signed /asb/ links with no uuid, so the attribute comes first and the URL is only a fallback.
@@ -194,9 +195,11 @@ async function waitForNewMedia(page: Page, before: string[], count: number, time
   let failures = 0;
   while (Date.now() < deadline) {
     await pause(page, 2000);
-    const fresh = [...new Set((await mediaIds(page)).filter((id) => !before.includes(id)))];
+    const fresh = [...new Set((await completedMediaIds(page, TILE_ID_JS)).filter((id) => !before.includes(id)))];
     // New tiles are listed first, so anything beyond the requested count is not ours.
     if (fresh.length >= count) return fresh.slice(0, count);
+    const refusal = await newPolicyRefusal(page, before, TILE_ID_JS);
+    if (refusal) throw new Error(`Flow rejected this prompt under its content policy. It was not retried. ${refusal}`);
     const progress = await page.evaluate(() =>
       [...document.querySelectorAll("flow-grid-tile-container")].slice(0, 8).map((t) => (t as HTMLElement).innerText.match(/\d+%/)?.[0]).filter(Boolean),
     );
@@ -217,7 +220,7 @@ async function waitForNewMedia(page: Page, before: string[], count: number, time
 }
 
 async function openSettings(page: Page): Promise<void> {
-  const probe = page.getByRole("radio", { name: "Image", exact: true });
+  const probe = page.getByRole("radio", { name: UI_NAMES.image });
   for (let attempt = 0; attempt < 3; attempt++) {
     if (await probe.isVisible().catch(() => false)) return;
     await settingsTrigger(page).click();
@@ -226,19 +229,8 @@ async function openSettings(page: Page): Promise<void> {
   if (!(await probe.isVisible().catch(() => false))) throw new Error("Could not open Flow's generation settings popover.");
 }
 
-async function pickRadio(page: Page, name: string | RegExp): Promise<void> {
-  const radio = page.getByRole("radio", { name, exact: typeof name === "string" }).first();
-  if (!(await radio.isVisible().catch(() => false))) {
-    throw new Error(`Flow has no "${name}" option for the current mode/model.`);
-  }
-  if (!(await radio.isChecked())) {
-    await radio.click();
-    await pause(page, 500);
-  }
-}
-
 async function pickModel(page: Page, model: string): Promise<void> {
-  const button = page.getByRole("button", { name: "Select model family" });
+  const button = page.getByRole("button", { name: UI_NAMES.selectModel });
   if ((await button.innerText()).toLowerCase().includes(model.toLowerCase())) return;
   await button.click();
   const items = page.getByRole("menuitem");
@@ -262,11 +254,12 @@ async function applySettings(page: Page, job: Job): Promise<number> {
   if (s.type === "video") await pickRadio(page, framesMode ? "Frames" : "Ingredients");
   if (s.aspect_ratio) await pickRadio(page, s.aspect_ratio);
   if (s.model) await pickModel(page, s.model);
-  if (s.type === "video" && s.resolution) await pickRadio(page, new RegExp(`^${s.resolution}`));
+  if (s.type === "video" && s.resolution) await pickRadio(page, new RegExp(`^${s.resolution}(?:\\s|$)`));
   if (s.type === "video" && s.duration) await pickRadio(page, `${s.duration}s`);
   await pickRadio(page, `x${s.variants ?? 1}`);
   await pause(page, 600);
-  const costText = await page.getByRole("link", { name: /credits?$/ }).innerText();
+  if (s.type === "video" && s.resolution) await verifyResolution(page, s.resolution);
+  const costText = await page.getByRole("link", { name: UI_NAMES.creditQuote }).innerText();
   const cost = Number(costText.match(/\d+/)?.[0] ?? NaN);
   await page.keyboard.press("Escape");
   await pause(page, 400);
@@ -286,9 +279,9 @@ async function uploadAsset(page: Page, job: Job, file: string, label: string): P
   copyFileSync(file, staged);
   await scrollToTop(page);
   const before = await mediaIds(page);
-  await page.getByRole("button", { name: "Add media menu" }).click();
+  await page.getByRole("button", { name: UI_NAMES.addMediaMenu }).click();
   const chooser = page.waitForEvent("filechooser", { timeout: 10_000 });
-  await page.getByRole("menuitem", { name: "Upload", exact: true }).click();
+  await page.getByRole("menuitem", { name: UI_NAMES.upload }).click();
   await (await chooser).setFiles(staged);
   await waitForNewMedia(page, before, 1, 90_000);
   return name;
@@ -300,17 +293,26 @@ const escapeRe = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 const optionByName = (list: Locator, name: string) =>
   list.getByRole("option", { name: new RegExp(`^${escapeRe(name)}`, "i") }).first();
 
-// The frame pickers attach on click; the ingredients picker only previews and needs "Add to prompt".
+// Current frame and ingredient pickers preview first, then require "Add to prompt".
 // Option names are "<asset name>" or "<asset name> Image|Video", so match on the prefix.
 async function attachAsset(page: Page, opener: Locator, assetName: string): Promise<void> {
   await opener.click();
-  const list = page.getByRole("listbox", { name: "Asset list" });
+  // The opened picker has one visible listbox; its accessible name is localized.
+  // Keep strict matching so an ambiguous picker fails before attaching the wrong asset.
+  const list = page.getByRole("listbox");
   await list.waitFor({ state: "visible", timeout: 10_000 });
   let option = optionByName(list, assetName);
+  // Long asset lists are virtualised: narrow them with the picker's search box first.
+  const searchBox = page.getByPlaceholder(/Search|Пошук/i).first();
+  if (await searchBox.isVisible().catch(() => false)) {
+      await searchBox.fill(assetName).catch(() => {});
+      await pause(page, 1200);
+  }
+  option = optionByName(list, assetName);
   // Voices, characters and avatars live behind their own tabs, so look there when "All" does not have it.
   if (!(await option.isVisible().catch(() => false))) {
-    for (const tab of ["Voices", "Characters", "Avatars", "Uploads"]) {
-      const t = page.getByRole("tab", { name: tab, exact: true });
+    for (const tab of [/(?:All|Усі)$/, /(?:Voices|Голоси)$/, /(?:Characters|Персонажі)$/, /(?:Avatars|Аватари)$/, /(?:Uploads|Додані файли)$/]) {
+      const t = page.getByRole("tab", { name: tab });
       if (!(await t.isVisible().catch(() => false))) continue;
       await t.click();
       await pause(page, 1200);
@@ -319,11 +321,7 @@ async function attachAsset(page: Page, opener: Locator, assetName: string): Prom
     }
   }
   await option.waitFor({ state: "visible", timeout: 10_000 });
-  await option.click();
-  const add = page.getByRole("button", { name: "Add to prompt", exact: true });
-  if (await add.waitFor({ state: "visible", timeout: 1500 }).then(() => true, () => false)) await add.click().catch(() => {});
-  await list.waitFor({ state: "hidden", timeout: 10_000 });
-  await pause(page, 500);
+  await completeAssetSelection(page, list, option);
 }
 
 async function typePrompt(page: Page, prompt: string): Promise<void> {
@@ -477,10 +475,10 @@ function unpackTakes(zip: string, targetStem: string): string[] {
 async function renameTile(page: Page, tile: Locator, title: string): Promise<boolean> {
   try {
     await hoverTile(page, tile);
-    const more = tile.getByRole("button", { name: "More options" });
+    const more = tile.getByRole("button", { name: UI_NAMES.moreOptions });
     if (!(await more.isVisible({ timeout: 3000 }).catch(() => false))) return false;
     await more.click();
-    const rename = page.getByRole("menuitem", { name: "Rename", exact: true });
+    const rename = page.getByRole("menuitem", { name: UI_NAMES.rename });
     if (!(await rename.isVisible({ timeout: 4000 }).catch(() => false))) {
       await page.keyboard.press("Escape");
       return false;
@@ -509,20 +507,12 @@ async function downloadTile(page: Page, target: Locator | TileResolver, targetSt
       // Flow only shows a tile's toolbar for a real pointer move over it - Playwright's hover() does not trigger it.
       // The toolbar's "More options" beats a right-click, which can land on the <video> and raise Chrome's own menu.
       await hoverTile(page, tile);
-      const more = tile.getByRole("button", { name: "More options" });
-      if (await more.isVisible({ timeout: 3000 }).catch(() => false)) await more.click();
-      else await tile.click({ button: "right" });
-      const download = page.getByRole("menuitem", { name: "Download", exact: true });
-      if (!(await download.isVisible({ timeout: 8000 }).catch(() => false))) {
-        // Saying what Flow actually offered turns "locator timed out" into something that explains itself next time.
-        const items = await page.locator('[role="menuitem"]').evaluateAll((ms) => ms.map((m) => (m.textContent ?? "").replace(/\s+/g, " ").trim()));
-        throw new Error(items.length ? `Flow's tile menu has no Download item. It offered: ${items.join(" | ")}` : "Flow's tile menu did not open.");
-      }
+      const download = await openTileDownloadMenu(page, tile);
       await download.click({ timeout: 10_000 });
       // Size submenu: "720p Original size" / "1K Original size", or the best upscale the plan allows.
-      const original = page.getByRole("menuitem", { name: /original/i }).first();
+      const original = page.getByRole("menuitem", { name: UI_NAMES.originalSize }).first();
       if (await original.waitFor({ state: "visible", timeout: 3000 }).then(() => true, () => false)) {
-        const upscaled = page.locator('[role="menuitem"]:not([aria-disabled="true"]):not([disabled])').filter({ hasText: /upscaled/i }).first();
+        const upscaled = page.locator('[role="menuitem"]:not([aria-disabled="true"]):not([disabled])').filter({ hasText: UI_NAMES.upscaled }).first();
         const wanted = quality === "upscaled" && (await upscaled.isVisible().catch(() => false)) ? upscaled : original;
         await wanted.click();
       }
@@ -551,11 +541,11 @@ async function downloadTile(page: Page, target: Locator | TileResolver, targetSt
 async function ensureProjectGrid(page: Page): Promise<void> {
   await dismissOverlays(page);
   const root = page.url().match(/^https:\/\/[^/]+\/project\/[0-9a-f-]{36}/)?.[0];
-  if (root && page.url() !== root) {
-    await page.goto(root, { waitUntil: "domcontentloaded" });
+  if (root && page.url() !== `${root}?hl=en`) {
+    await page.goto(`${root}?hl=en`, { waitUntil: "domcontentloaded" });
     await pause(page, 2500);
   }
-  await page.getByRole("navigation", { name: "Project navigation" }).getByText("All media", { exact: true }).click().catch(() => {});
+  await allMediaControl(page).click().catch(() => {});
   await pause(page, 800);
   await scrollToTop(page);
 }
@@ -568,9 +558,8 @@ export async function runGeneration(job: Job): Promise<string[]> {
   const s = job.params;
 
   await ensureProjectGrid(page);
-  const agent = page.getByRole("button", { name: "Agent", exact: true });
-  if ((await agent.getAttribute("aria-pressed")) === "true") await agent.click();
-  const clear = page.getByRole("button", { name: "Clear prompt" });
+  await setAgentMode(page, false);
+  const clear = page.getByRole("button", { name: UI_NAMES.clearPrompt });
   if (await clear.isVisible().catch(() => false)) await clear.click();
 
   job.credits = await applySettings(page, job);
@@ -581,10 +570,10 @@ export async function runGeneration(job: Job): Promise<string[]> {
   }
 
   if (s.first_frame) {
-    await attachAsset(page, page.getByRole("button", { name: "Start", exact: true }), await uploadAsset(page, job, s.first_frame, "start"));
+    await attachAsset(page, page.getByRole("button", { name: UI_NAMES.firstFrame }), await uploadAsset(page, job, s.first_frame, "start"));
   }
   if (s.last_frame) {
-    await attachAsset(page, page.getByRole("button", { name: "End", exact: true }), await uploadAsset(page, job, s.last_frame, "end"));
+    await attachAsset(page, page.getByRole("button", { name: UI_NAMES.lastFrame }), await uploadAsset(page, job, s.last_frame, "end"));
   }
   // Flow's composer offers Frames OR Ingredients, never both: a clip with first/last frames cannot also carry
   // reference images. The frames already pin the look, so the references are dropped and the job says so.
@@ -597,16 +586,16 @@ export async function runGeneration(job: Job): Promise<string[]> {
   }
   for (const [i, ref] of (s.reference_images ?? []).entries()) {
     const name = await uploadAsset(page, job, ref, `ref${i + 1}`);
-    await attachAsset(page, page.getByRole("button", { name: "Add ingredients to the prompt box" }), name);
+    await attachAsset(page, page.getByRole("button", { name: UI_NAMES.addIngredients }), name);
   }
   const wanted = (s.reference_images ?? []).length;
   if (wanted) {
-    const attached = await page.getByRole("button", { name: "Ingredient" }).count();
+    const attached = await page.getByRole("button", { name: UI_NAMES.attachedIngredient }).count();
     if (attached < wanted) throw new Error(`Only ${attached} of ${wanted} reference image(s) attached in Flow; nothing was generated.`);
   }
 
   await typePrompt(page, s.prompt);
-  const start = page.getByRole("button", { name: "Start generation" });
+  const start = page.getByRole("button", { name: UI_NAMES.startGeneration });
   if (!(await start.isEnabled())) throw new Error("Flow's Start generation button is disabled; the prompt or inputs were not accepted.");
   await scrollToTop(page);
   const before = await mediaIds(page);
@@ -643,7 +632,7 @@ export interface FlowAsset {
 // media id yet, so entries are keyed by title and the id is filled in from whichever pass saw it.
 async function scanGrid(page: Page, stopAt?: (assets: FlowAsset[]) => boolean): Promise<FlowAsset[]> {
   await dismissOverlays(page);
-  await page.getByRole("navigation", { name: "Project navigation" }).getByText("All media", { exact: true }).click().catch(() => {});
+  await allMediaControl(page).click().catch(() => {});
   await pause(page, 600);
   await scrollToTop(page);
   const seen = new Map<string, FlowAsset>();
@@ -767,7 +756,7 @@ export async function editCharacter(name: string, change?: string, job?: Job): P
     const told = `${change.replace(/\s*\n+\s*/g, " ").trim().replace(/[.\s]*$/, ".")} Exactly one ${name} in the picture: never add copies of ${name} or extra poses side by side.`;
     await page.keyboard.type(told, { delay: 8 });
     await pause(page, 600);
-    const start = page.getByRole("button", { name: "Start generation" });
+    const start = page.getByRole("button", { name: UI_NAMES.startGeneration });
     if (!(await start.isEnabled())) throw new Error("Flow did not accept the change (Start generation stayed disabled).");
     await start.click();
 
@@ -793,7 +782,7 @@ export async function editCharacter(name: string, change?: string, job?: Job): P
   }
 
   await leaveCharacterEditor(page);
-  const clear = page.getByRole("button", { name: "Clear prompt" });
+  const clear = page.getByRole("button", { name: UI_NAMES.clearPrompt });
   if (await clear.isVisible().catch(() => false)) await clear.click();
   return { name, portrait, note };
 }
@@ -835,7 +824,7 @@ export async function trashAsset(name: string): Promise<{ trashed: string }> {
   await scanGrid(page, (seen) => seen.some((a) => a.name === name));
   const tile = tileOf(page, same[0]);
   await hoverTile(page, tile);
-  await tile.getByRole("button", { name: "More options" }).click();
+  await tile.getByRole("button", { name: UI_NAMES.moreOptions }).click();
   await page.getByRole("menuitem", { name: "Move to trash", exact: true }).click();
   await pause(page, 2000);
   if (await tile.count()) throw new Error(`"${name}" is still in the project - Flow did not move it to Trash.`);
@@ -939,7 +928,7 @@ export async function createCharacter(c: CharacterParams, job?: Job): Promise<{ 
     await list.waitFor({ state: "visible", timeout: 10_000 });
     let option = optionByName(list, title);
     if (!(await option.isVisible().catch(() => false))) {
-      await page.getByRole("tab", { name: "Uploads" }).click();
+      await page.getByRole("tab", { name: UI_NAMES.uploadsTab }).click();
       await pause(page, 1000);
       option = optionByName(list, title);
     }
@@ -952,7 +941,7 @@ export async function createCharacter(c: CharacterParams, job?: Job): Promise<{ 
   } else {
     if (!existsSync(image)) throw new Error(`File not found: ${image}`);
     const chooser = page.waitForEvent("filechooser", { timeout: 10_000 });
-    await page.getByRole("button", { name: "Upload", exact: true }).click();
+    await page.getByRole("button", { name: UI_NAMES.upload }).click();
     await (await chooser).setFiles(image);
   }
   await page.waitForURL(/\/character\/[0-9a-f-]{36}/, { timeout: 90_000 });
@@ -982,12 +971,12 @@ export async function createCharacter(c: CharacterParams, job?: Job): Promise<{ 
 
   // Flow labels this "Done editing" or just "Done" depending on the panel state.
   await page.getByRole("button", { name: /^Done( editing)?$/ }).first().click();
-  await page.waitForURL((u) => !/\/character/.test(u.pathname), { timeout: 15_000 }).catch(() => page.goto(projectUrl));
+  await page.waitForURL((u) => !/\/character/.test(u.pathname), { timeout: 15_000 }).catch(() => page.goto(`${projectUrl.split("?")[0]}?hl=en`));
   await pause(page, 1000);
   // Flow drops the new character into the composer; leave the composer empty for the next job.
-  const clear = page.getByRole("button", { name: "Clear prompt" });
+  const clear = page.getByRole("button", { name: UI_NAMES.clearPrompt });
   if (await clear.isVisible().catch(() => false)) await clear.click();
-  await page.getByRole("navigation", { name: "Project navigation" }).getByText("All media", { exact: true }).click().catch(() => {});
+  await allMediaControl(page).click().catch(() => {});
   if (c.describe) rememberCharacter(c.name, c.describe);
   return { name: c.name, url, portrait };
 }
@@ -1025,7 +1014,7 @@ export async function runEdit(job: Job): Promise<string[]> {
   const prompt = s.prompt.replace(/\s*\n+\s*/g, " ").trim();
   await page.keyboard.type(prompt, { delay: 8 });
   await pause(page, 600);
-  const start = page.getByRole("button", { name: "Start generation" });
+  const start = page.getByRole("button", { name: UI_NAMES.startGeneration });
   if (!(await start.isEnabled())) throw new Error("Flow did not accept the edit prompt (Start generation stayed disabled).");
   await start.click();
 
@@ -1056,24 +1045,9 @@ export async function runEdit(job: Job): Promise<string[]> {
   return saved;
 }
 
-// The agent session panel hides the composer, so a toggle attempted underneath it does nothing at all. Leaving agent
-// mode on then breaks the NEXT job, which expects the plain composer - a free character build failed that way. So this
-// confirms the toggle actually landed rather than assuming the click worked.
-async function setAgentMode(page: Page, on: boolean): Promise<void> {
-  const agent = page.getByRole("button", { name: "Agent", exact: true });
-  for (let attempt = 0; attempt < 3; attempt++) {
-    if (((await agent.getAttribute("aria-pressed").catch(() => null)) === "true") === on) return;
-    await agent.click({ timeout: 8000 }).catch(() => {});
-    await pause(page, 1500);
-  }
-  if (((await agent.getAttribute("aria-pressed").catch(() => null)) === "true") !== on) {
-    throw new Error(`Could not switch Agent mode ${on ? "on" : "off"}; the composer may be covered by the agent session panel.`);
-  }
-}
-
 // "Never" lets the agent generate without asking; it is switched back to "Always" as soon as the batch ends.
 async function setAgentSettings(page: Page, confirm: "Always" | "Never", imageAspect?: string): Promise<void> {
-  await page.getByRole("button", { name: "Settings", exact: true }).click();
+  await page.getByRole("button", { name: UI_NAMES.settings, exact: true }).click();
   await page.getByRole("heading", { name: "Agent settings" }).waitFor({ state: "visible", timeout: 8000 });
   await page.getByRole("radio", { name: new RegExp(`^${confirm}`) }).click();
   if (imageAspect) {
@@ -1092,7 +1066,7 @@ async function closeAgentSession(page: Page): Promise<void> {
     await page.getByRole("button", { name: "Close", exact: true }).click();
     await pause(page, 1000);
   }
-  const clear = page.getByRole("button", { name: "Clear prompt" });
+  const clear = page.getByRole("button", { name: UI_NAMES.clearPrompt });
   if (await clear.isVisible().catch(() => false)) await clear.click();
   else {
     await page.locator(".ProseMirror").first().click();
@@ -1157,7 +1131,7 @@ async function agentRound(
   const beforeNames = new Set<string>(seenBefore.filter((a) => !a.id).map((a) => a.name));
   await scrollToTop(page);
 
-  const clear = page.getByRole("button", { name: "Clear prompt" });
+  const clear = page.getByRole("button", { name: UI_NAMES.clearPrompt });
   if (await clear.isVisible().catch(() => false)) await clear.click();
   const script = indexes.map((i) => `Scene ${i + 1}: ${scenes[i].replace(/\s*\n+\s*/g, " ").trim()}`).join(" ");
   const lead = retry
@@ -1167,7 +1141,7 @@ async function agentRound(
   await page.locator(".ProseMirror").first().click();
   await page.keyboard.insertText(ask);
   await pause(page, 800);
-  const start = page.getByRole("button", { name: "Start generation" });
+  const start = page.getByRole("button", { name: UI_NAMES.startGeneration });
   if (!(await start.isEnabled())) throw new Error("Flow's agent did not accept the script (Start generation stayed disabled).");
   await start.click();
 
@@ -1207,7 +1181,7 @@ async function agentRound(
     const el = mediaTile(page, tile.id!);
     await el.scrollIntoViewIfNeeded();
     await el.hover();
-    await el.getByRole("button", { name: "Reuse prompt" }).click();
+    await el.getByRole("button", { name: UI_NAMES.reusePrompt }).click();
     await pause(page, 900);
     prompts.push(await page.locator(".ProseMirror").first().innerText());
   }
@@ -1279,7 +1253,7 @@ export async function runContinue(job: Job): Promise<string[]> {
     const frame = page.locator(`flow-grid-tile-container[aria-label="${`Saved frame from ${source.name}`.replace(/"/g, '\\"')}"]`).first();
     await frame.waitFor({ state: "visible", timeout: 30_000 });
     await hoverTile(page, frame);
-    await frame.getByRole("button", { name: "More options" }).click();
+    await frame.getByRole("button", { name: UI_NAMES.moreOptions }).click();
     await pause(page, 1500);
     await page.getByRole("menuitem", { name: "Animate", exact: true }).click();
     await pause(page, 3500);
@@ -1288,7 +1262,7 @@ export async function runContinue(job: Job): Promise<string[]> {
     // 3. The second chip: an avatar ("Me") or any character. Only useful in likeness mode - Flow's first-frame tool
     //    (I2V) ignores extra references, and attaching one just makes the agent stop and ask which we meant.
     for (const name of s.continue_mode === "likeness" ? (s.attach ?? []) : []) {
-      await attachAsset(page, page.getByRole("button", { name: "Add ingredients to the prompt box" }), name);
+      await attachAsset(page, page.getByRole("button", { name: UI_NAMES.addIngredients }), name);
       await pause(page, 1200);
     }
 
@@ -1314,7 +1288,7 @@ export async function runContinue(job: Job): Promise<string[]> {
     );
     const before = await mediaIds(page);
     job.progress = "generating";
-    await page.getByRole("button", { name: "Start generation" }).click();
+    await page.getByRole("button", { name: UI_NAMES.startGeneration }).click();
 
     // The agent sometimes still stops to ask which tool to use. Nobody is watching an unattended run, so answer it.
     for (let i = 0; i < 12; i++) {
@@ -1350,7 +1324,7 @@ export async function runContinue(job: Job): Promise<string[]> {
     await ensureProjectGrid(page).catch(() => {});
     await setAgentSettings(page, "Always").catch(() => {});
     await setAgentMode(page, false).catch(() => {});
-    const clear = page.getByRole("button", { name: "Clear prompt" });
+    const clear = page.getByRole("button", { name: UI_NAMES.clearPrompt });
     if (await clear.isVisible().catch(() => false)) await clear.click().catch(() => {});
   }
 }
